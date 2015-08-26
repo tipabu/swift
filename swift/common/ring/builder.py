@@ -1150,8 +1150,9 @@ class RingBuilder(object):
         """
         fudge_available_in_tier = defaultdict(int)
         parts_available_in_tier = defaultdict(int)
+        parts_in_tier = defaultdict(int)
+        max_tier_depth = 0
         for dev in self._iter_devs():
-            dev['sort_key'] = self._sort_key_for(dev)
             tiers = tiers_for_dev(dev)
             dev['tiers'] = tiers
             # Note: this represents how many partitions may be assigned to a
@@ -1170,36 +1171,22 @@ class RingBuilder(object):
             for tier in tiers:
                 fudge_available_in_tier[tier] += (wanted + fudge)
                 parts_available_in_tier[tier] += wanted
-
-        available_devs = \
-            sorted((d for d in self._iter_devs() if d['weight']),
-                   key=lambda x: x['sort_key'])
-
-        tier2devs = defaultdict(list)
-        tier2sort_key = defaultdict(tuple)
-        tier2dev_sort_key = defaultdict(list)
-        max_tier_depth = 0
-        for dev in available_devs:
-            for tier in dev['tiers']:
-                tier2devs[tier].append(dev)  # <-- starts out sorted!
-                tier2dev_sort_key[tier].append(dev['sort_key'])
-                tier2sort_key[tier] = dev['sort_key']
+                parts_in_tier[tier] += dev['parts']
                 if len(tier) > max_tier_depth:
                     max_tier_depth = len(tier)
 
+        available_devs = [d for d in self._iter_devs() if d['weight']]
+
         tier2children_sets = build_tier_tree(available_devs)
         tier2children = defaultdict(list)
-        tier2children_sort_key = {}
         tiers_list = [()]
         depth = 1
         while depth <= max_tier_depth:
             new_tiers_list = []
             for tier in tiers_list:
                 child_tiers = list(tier2children_sets[tier])
-                child_tiers.sort(key=tier2sort_key.__getitem__)
+                #child_tiers.sort(key=tier2sort_key.__getitem__)
                 tier2children[tier] = child_tiers
-                tier2children_sort_key[tier] = map(
-                    tier2sort_key.__getitem__, child_tiers)
                 new_tiers_list.extend(child_tiers)
             tiers_list = new_tiers_list
             depth += 1
@@ -1250,8 +1237,6 @@ class RingBuilder(object):
                     # with the largest sort_key value). This lets us
                     # short-circuit the search while still ensuring we get the
                     # right tier.
-                    candidates_with_replicas = \
-                        occupied_tiers_by_tier_len[len(tier) + 1]
 
                     # Among the tiers with room for more partitions,
                     # find one with the smallest possible number of
@@ -1266,28 +1251,14 @@ class RingBuilder(object):
                     candidates_with_fudge.update(candidates_with_room)
 
                     if candidates_with_room:
-                        if len(candidates_with_room) > \
-                           len(candidates_with_replicas):
-                            # There exists at least one tier with room for
-                            # another partition and 0 other replicas already
-                            # in it, so we can use a faster search. The else
-                            # branch's search would work here, but it's
-                            # significantly slower.
-                            roomiest_tier = max(
-                                (t for t in candidates_with_room
-                                 if other_replicas[t] == 0),
-                                key=tier2sort_key.__getitem__)
-                        else:
-                            roomiest_tier = max(
-                                candidates_with_room,
-                                key=lambda t: (-other_replicas[t],
-                                               tier2sort_key[t]))
+                        roomiest_tier = max(
+                            candidates_with_room,
+                            key=lambda t: float(parts_available_in_tier[t]) / (parts_available_in_tier[t] + parts_in_tier[t]))
                     else:
                         roomiest_tier = None
 
                     fudgiest_tier = max(candidates_with_fudge,
-                                        key=lambda t: (-other_replicas[t],
-                                                       tier2sort_key[t]))
+                                        key=lambda t: float(fudge_available_in_tier[t]) / (fudge_available_in_tier[t] + parts_in_tier[t]))
 
                     if (roomiest_tier is None or
                         (other_replicas[roomiest_tier] >
@@ -1297,57 +1268,20 @@ class RingBuilder(object):
                         tier = roomiest_tier
                     depth += 1
 
-                dev = tier2devs[tier][-1]
-                dev['parts_wanted'] -= 1
-                dev['parts'] += 1
-                old_sort_key = dev['sort_key']
-                new_sort_key = dev['sort_key'] = self._sort_key_for(dev)
-                for tier in dev['tiers']:
-                    parts_available_in_tier[tier] -= 1
-                    fudge_available_in_tier[tier] -= 1
-                    other_replicas[tier] += 1
-                    occupied_tiers_by_tier_len[len(tier)].add(tier)
+                for super_tier in (tier[:i] for i in range(len(tier) + 1)):
+                    parts_available_in_tier[super_tier] -= 1
+                    fudge_available_in_tier[super_tier] -= 1
+                    parts_in_tier[super_tier] += 1
+                    other_replicas[super_tier] += 1
+                    occupied_tiers_by_tier_len[len(super_tier)].add(super_tier)
 
-                    index = bisect.bisect_left(tier2dev_sort_key[tier],
-                                               old_sort_key)
-                    tier2devs[tier].pop(index)
-                    tier2dev_sort_key[tier].pop(index)
-
-                    new_index = bisect.bisect_left(tier2dev_sort_key[tier],
-                                                   new_sort_key)
-                    tier2devs[tier].insert(new_index, dev)
-                    tier2dev_sort_key[tier].insert(new_index, new_sort_key)
-
-                    new_last_sort_key = tier2dev_sort_key[tier][-1]
-                    tier2sort_key[tier] = new_last_sort_key
-
-                    # Now jiggle tier2children values to keep them sorted
-                    parent_tier = tier[0:-1]
-                    index = bisect.bisect_left(
-                        tier2children_sort_key[parent_tier],
-                        old_sort_key)
-                    popped = tier2children[parent_tier].pop(index)
-                    tier2children_sort_key[parent_tier].pop(index)
-
-                    new_index = bisect.bisect_left(
-                        tier2children_sort_key[parent_tier],
-                        new_last_sort_key)
-                    tier2children[parent_tier].insert(new_index, popped)
-                    tier2children_sort_key[parent_tier].insert(
-                        new_index, new_last_sort_key)
-
-                self._replica2part2dev[replica][part] = dev['id']
+                self._replica2part2dev[replica][part] = tier[-1]
                 self.logger.debug(
-                    "Placed %d/%d onto dev %d", part, replica, dev['id'])
+                    "Placed %d/%d onto dev %d", part, replica, tier[-1])
 
         # Just to save memory and keep from accidental reuse.
         for dev in self._iter_devs():
-            del dev['sort_key']
             del dev['tiers']
-
-    @staticmethod
-    def _sort_key_for(dev):
-        return (dev['parts_wanted'], random.randint(0, 0xFFFF), dev['id'])
 
     def _build_max_replicas_by_tier(self):
         """
