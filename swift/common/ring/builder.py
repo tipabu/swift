@@ -1152,7 +1152,9 @@ class RingBuilder(object):
         parts_available_in_tier = defaultdict(int)
         parts_in_tier = defaultdict(int)
         max_tier_depth = 0
+        id2dev = {}
         for dev in self._iter_devs():
+            id2dev[dev['id']] = dev
             tiers = tiers_for_dev(dev)
             dev['tiers'] = tiers
             # Note: this represents how many partitions may be assigned to a
@@ -1258,7 +1260,7 @@ class RingBuilder(object):
                         roomiest_tier = None
 
                     fudgiest_tier = max(candidates_with_fudge,
-                                        key=lambda t: float(fudge_available_in_tier[t]) / (fudge_available_in_tier[t] + parts_in_tier[t]))
+                                        key=lambda t: float(fudge_available_in_tier[t]) / (parts_available_in_tier[t] + parts_in_tier[t]))
 
                     if (roomiest_tier is None or
                         (other_replicas[roomiest_tier] >
@@ -1275,9 +1277,12 @@ class RingBuilder(object):
                     other_replicas[super_tier] += 1
                     occupied_tiers_by_tier_len[len(super_tier)].add(super_tier)
 
-                self._replica2part2dev[replica][part] = tier[-1]
+                dev = id2dev[tier[-1]]
+                dev['parts'] += 1
+                dev['parts_wanted'] -= 1
+                self._replica2part2dev[replica][part] = dev['id']
                 self.logger.debug(
-                    "Placed %d/%d onto dev %d", part, replica, tier[-1])
+                    "Placed %d/%d onto dev %d", part, replica, dev['id'])
 
         # Just to save memory and keep from accidental reuse.
         for dev in self._iter_devs():
