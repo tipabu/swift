@@ -1151,7 +1151,6 @@ class RingBuilder(object):
         fudge_available_in_tier = defaultdict(int)
         parts_available_in_tier = defaultdict(int)
         parts_in_tier = defaultdict(int)
-        max_tier_depth = 0
         id2dev = {}
         for dev in self._iter_devs():
             id2dev[dev['id']] = dev
@@ -1170,12 +1169,15 @@ class RingBuilder(object):
             # removed, which is a pretty frequent operation.
             wanted = max(dev['parts_wanted'], 0)
             fudge = self._n_overload_parts(dev)
+            self.logger.debug(
+                "Dev %(id)d has %(parts)d, wants %(parts_wanted)d", dev)
             for tier in tiers:
                 fudge_available_in_tier[tier] += (wanted + fudge)
                 parts_available_in_tier[tier] += wanted
                 parts_in_tier[tier] += dev['parts']
-                if len(tier) > max_tier_depth:
-                    max_tier_depth = len(tier)
+        # tiers_for_dev gives us tiers by increasing length, and all devices
+        # should be at the same depth:
+        max_tier_depth = len(tiers[-1])
 
         available_devs = [d for d in self._iter_devs() if d['weight']]
 
@@ -1193,6 +1195,7 @@ class RingBuilder(object):
             tiers_list = new_tiers_list
             depth += 1
 
+        max_allowed_replicas = self._build_weighted_max_replicas_by_tier()
         for part, replace_replicas in reassign_parts:
             # Gather up what other tiers (regions, zones, ip/ports, and
             # devices) the replicas not-to-be-moved are in for this part.
@@ -1202,6 +1205,7 @@ class RingBuilder(object):
                 if replica not in replace_replicas:
                     dev = self.devs[self._replica2part2dev[replica][part]]
                     for tier in dev['tiers']:
+                        #max_allowed_replicas[tier] -= 1
                         other_replicas[tier] += 1
                         occupied_tiers_by_tier_len[len(tier)].add(tier)
 
@@ -1246,21 +1250,36 @@ class RingBuilder(object):
                     # has the hungriest drive.
                     candidates_with_room = [
                         t for t in tier2children[tier]
-                        if parts_available_in_tier[t] > 0]
+                        if parts_available_in_tier[t] > 0
+                        and max_allowed_replicas[t] > other_replicas[t]]
                     candidates_with_fudge = set([
                         t for t in tier2children[tier]
                         if fudge_available_in_tier[t] > 0])
+#                        and max_allowed_replicas[t] > other_replicas[t]])
                     candidates_with_fudge.update(candidates_with_room)
+
+                    def _sort_key(tier):
+                        return tuple([
+max_allowed_replicas[tier] - other_replicas[tier],
+other_replicas[tier] == 0,
+float(parts_available_in_tier[tier]) / (parts_available_in_tier[tier] + parts_in_tier[tier]),
+parts_available_in_tier[tier],
+random.random()])
 
                     if candidates_with_room:
                         roomiest_tier = max(
                             candidates_with_room,
-                            key=lambda t: float(parts_available_in_tier[t]) / (parts_available_in_tier[t] + parts_in_tier[t]))
+                            key=_sort_key)
+                        __builtins__.setdefault('tburke', 1000)
+                        if __builtins__['tburke'] < 100:
+                            self.logger.debug({t:_sort_key(t) for t in candidates_with_room})
+                            __builtins__['tburke'] += 1
+                        #import pudb;pu.db()
                     else:
                         roomiest_tier = None
 
                     fudgiest_tier = max(candidates_with_fudge,
-                                        key=lambda t: float(fudge_available_in_tier[t]) / (parts_available_in_tier[t] + parts_in_tier[t]))
+                                        key=_sort_key)
 
                     if (roomiest_tier is None or
                         (other_replicas[roomiest_tier] >
@@ -1273,6 +1292,7 @@ class RingBuilder(object):
                 for super_tier in (tier[:i] for i in range(len(tier) + 1)):
                     parts_available_in_tier[super_tier] -= 1
                     fudge_available_in_tier[super_tier] -= 1
+                    #max_allowed_replicas[super_tier] -= 1
                     parts_in_tier[super_tier] += 1
                     other_replicas[super_tier] += 1
                     occupied_tiers_by_tier_len[len(super_tier)].add(super_tier)
@@ -1342,16 +1362,47 @@ class RingBuilder(object):
         tier2children = build_tier_tree(d for d in self._iter_devs() if
                                         d['weight'])
 
-        def walk_tree(tier, replica_count):
-            mr = {tier: replica_count}
-            if tier in tier2children:
-                subtiers = tier2children[tier]
-                for subtier in subtiers:
-                    submax = math.ceil(float(replica_count) / len(subtiers))
-                    mr.update(walk_tree(subtier, submax))
-            return mr
         mr = defaultdict(float)
-        mr.update(walk_tree((), self.replicas))
+        mr[()] = float(self.replicas)
+        def walk_tree(tier):
+            subtiers = tier2children.get(tier, [])
+            for subtier in subtiers:
+                mr[subtier] = math.ceil(mr[tier] / len(subtiers))
+                walk_tree(subtier)
+        walk_tree(())
+        return mr
+
+    def _build_weighted_max_replicas_by_tier(self):
+        tier2children = build_tier_tree(d for d in self._iter_devs() if
+                                        d['weight'])
+
+        tier2weight = {tiers_for_dev(d)[-1]: d['weight']
+                       for d in self._iter_devs()}
+        tier2avg_sub_weight = {}
+        def assign_weights(tier):
+            total_weight = 0
+            subtiers = tier2children.get(tier, [])
+            for subtier in subtiers:
+                assign_weights(subtier)
+                total_weight += tier2weight[subtier]
+            tier2weight.setdefault(tier, total_weight)
+            tier2avg_sub_weight[tier] = total_weight / (len(subtiers) or 1)
+        assign_weights(())
+
+        mr = defaultdict(float)
+        mr[()] = float(self.replicas)
+        def walk_tree(tier):
+            subtiers = tier2children.get(tier, [])
+            for subtier in subtiers:
+                mr[subtier] = math.ceil(
+                    mr[tier] *
+                    tier2weight[subtier] / tier2weight[tier])
+                if mr[subtier] <= math.ceil(mr[tier] / len(subtiers)):
+                    mr[subtier] = math.ceil(
+                        mr[tier] * (1.0 + self._effective_overload) *
+                        tier2weight[subtier] / tier2weight[tier])
+                walk_tree(subtier)
+        walk_tree(())
         return mr
 
     def _devs_for_part(self, part):

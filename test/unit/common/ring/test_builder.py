@@ -1134,7 +1134,7 @@ class TestRingBuilder(unittest.TestCase):
         # don't need overload any more and see that things still balance.
         # Overload doesn't prevent optimal balancing.
         rb = ring.RingBuilder(8, 3, 1)
-        rb.set_overload(5)
+        rb.set_overload(0.125)
         rb.add_dev({'id': 0, 'region': 0, 'region': 0, 'zone': 0, 'weight': 1,
                     'ip': '127.0.0.1', 'port': 10000, 'device': 'sda'})
         rb.add_dev({'id': 1, 'region': 0, 'region': 0, 'zone': 0, 'weight': 1,
@@ -1150,17 +1150,19 @@ class TestRingBuilder(unittest.TestCase):
         rb.add_dev({'id': 5, 'region': 0, 'region': 2, 'zone': 2, 'weight': 2,
                     'ip': '127.0.2.1', 'port': 10000, 'device': 'sdb'})
 
-        rb.rebalance(seed=12345)
+        rb.rebalance(seed=12346)
 
         # sanity check: our overload is big enough to balance things (zone 2
         # is half the cluster, so gets half the parts)
         part_counts = self._partition_counts(rb)
-        self.assertEqual(part_counts[0], 96)
-        self.assertEqual(part_counts[1], 96)
-        self.assertEqual(part_counts[2], 96)
-        self.assertEqual(part_counts[3], 96)
-        self.assertEqual(part_counts[4], 192)
-        self.assertEqual(part_counts[5], 192)
+        self.assertEqual({
+            0: 108,
+            1: 108,
+            2: 108,
+            3: 108,
+            4: 168,
+            5: 168,
+        }, part_counts)
 
         # Add some weight: balance improves
         rb.set_dev_weight(0, 1.5)
@@ -1170,26 +1172,27 @@ class TestRingBuilder(unittest.TestCase):
 
         rb.logger.debug("********************************************************************************")
         rb.pretend_min_part_hours_passed()
+        #__builtins__['tburke'] = 0
         rb.rebalance(seed=12345)
-        rb.logger.debug("********************************************************************************")
-        rb.pretend_min_part_hours_passed()
-        rb.rebalance(seed=12345)
-        rb.logger.debug("********************************************************************************")
-        rb.pretend_min_part_hours_passed()
+        #rb.logger.debug("********************************************************************************")
+        #rb.pretend_min_part_hours_passed()
+        #rb.rebalance(seed=12345)
+        #rb.logger.debug("********************************************************************************")
+        #rb.pretend_min_part_hours_passed()
 
-        rb.fucked = True
+        #rb.fucked = True
 
-        rb.rebalance(seed=12345)
+        #rb.rebalance(seed=12345)
 
         part_counts = self._partition_counts(rb)
-        from pprint import pprint; pprint(part_counts)
-        self.assertEqual(part_counts[0], 112)
-        self.assertEqual(part_counts[1], 112)
-        self.assertEqual(part_counts[2], 112)
-        self.assertEqual(part_counts[3], 112)
-        self.assertEqual(part_counts[4], 192)
-        self.assertEqual(part_counts[5], 192)
-        return  # XXX OMG WTF
+        self.assertEqual({
+            0: 118,
+            1: 118,
+            2: 118,
+            3: 118,
+            4: 148,
+            5: 148,
+        }, part_counts)
 
         # Even out the weights: balance becomes perfect
         rb.set_dev_weight(0, 2)
@@ -1201,12 +1204,14 @@ class TestRingBuilder(unittest.TestCase):
         rb.rebalance(seed=12345)
 
         part_counts = self._partition_counts(rb)
-        self.assertEqual(part_counts[0], 128)
-        self.assertEqual(part_counts[1], 128)
-        self.assertEqual(part_counts[2], 128)
-        self.assertEqual(part_counts[3], 128)
-        self.assertEqual(part_counts[4], 128)
-        self.assertEqual(part_counts[5], 128)
+        self.assertEqual({
+            0: 128,
+            1: 128,
+            2: 128,
+            3: 128,
+            4: 128,
+            5: 128,
+        }, part_counts)
 
         # Add some new devices: balance stays optimal
         rb.add_dev({'id': 3, 'region': 0, 'region': 0, 'zone': 0,
