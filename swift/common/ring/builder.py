@@ -1151,9 +1151,7 @@ class RingBuilder(object):
         fudge_available_in_tier = defaultdict(int)
         parts_available_in_tier = defaultdict(int)
         parts_in_tier = defaultdict(int)
-        id2dev = {}
         for dev in self._iter_devs():
-            id2dev[dev['id']] = dev
             tiers = tiers_for_dev(dev)
             dev['tiers'] = tiers
             # Note: this represents how many partitions may be assigned to a
@@ -1189,7 +1187,6 @@ class RingBuilder(object):
             new_tiers_list = []
             for tier in tiers_list:
                 child_tiers = list(tier2children_sets[tier])
-                #child_tiers.sort(key=tier2sort_key.__getitem__)
                 tier2children[tier] = child_tiers
                 new_tiers_list.extend(child_tiers)
             tiers_list = new_tiers_list
@@ -1205,9 +1202,21 @@ class RingBuilder(object):
                 if replica not in replace_replicas:
                     dev = self.devs[self._replica2part2dev[replica][part]]
                     for tier in dev['tiers']:
-                        #max_allowed_replicas[tier] -= 1
                         other_replicas[tier] += 1
                         occupied_tiers_by_tier_len[len(tier)].add(tier)
+
+            def _sort_key(tier):
+                return tuple([
+                    # Prefer tiers that want the most replicas
+                    max_allowed_replicas[tier] - other_replicas[tier],
+                    # Prefer tiers without *any* replicas
+                    other_replicas[tier] == 0,
+                    # Prefer hungrier tiers
+                    float(parts_available_in_tier[tier]) /
+                    (parts_available_in_tier[tier] + parts_in_tier[tier]),
+                    # Prefer larger tiers
+                    parts_available_in_tier[tier],
+                    random.random()])
 
             for replica in replace_replicas:
                 # Find a new home for this replica
@@ -1255,26 +1264,12 @@ class RingBuilder(object):
                     candidates_with_fudge = set([
                         t for t in tier2children[tier]
                         if fudge_available_in_tier[t] > 0])
-#                        and max_allowed_replicas[t] > other_replicas[t]])
                     candidates_with_fudge.update(candidates_with_room)
-
-                    def _sort_key(tier):
-                        return tuple([
-max_allowed_replicas[tier] - other_replicas[tier],
-other_replicas[tier] == 0,
-float(parts_available_in_tier[tier]) / (parts_available_in_tier[tier] + parts_in_tier[tier]),
-parts_available_in_tier[tier],
-random.random()])
 
                     if candidates_with_room:
                         roomiest_tier = max(
                             candidates_with_room,
                             key=_sort_key)
-                        __builtins__.setdefault('tburke', 1000)
-                        if __builtins__['tburke'] < 100:
-                            self.logger.debug({t:_sort_key(t) for t in candidates_with_room})
-                            __builtins__['tburke'] += 1
-                        #import pudb;pu.db()
                     else:
                         roomiest_tier = None
 
@@ -1297,7 +1292,7 @@ random.random()])
                     other_replicas[super_tier] += 1
                     occupied_tiers_by_tier_len[len(super_tier)].add(super_tier)
 
-                dev = id2dev[tier[-1]]
+                dev = self.devs[tier[-1]]
                 dev['parts'] += 1
                 dev['parts_wanted'] -= 1
                 self._replica2part2dev[replica][part] = dev['id']

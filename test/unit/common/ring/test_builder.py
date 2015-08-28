@@ -790,42 +790,50 @@ class TestRingBuilder(unittest.TestCase):
         rb = ring.RingBuilder(8, 3, 1)
         rb.add_dev({'id': 0, 'region': 0, 'zone': 0, 'weight': 2,
                     'ip': '127.0.0.1', 'port': 10000, 'device': 'sda1'})
-        rb.add_dev({'id': 1, 'region': 0, 'zone': 1, 'weight': 2,
-                    'ip': '127.0.0.1', 'port': 10001, 'device': 'sda1'})
-        rb.rebalance(seed=2)
+        rb.add_dev({'id': 1, 'region': 0, 'zone': 0, 'weight': 2,
+                    'ip': '127.0.0.1', 'port': 10001, 'device': 'sdb1'})
+        rb.add_dev({'id': 2, 'region': 0, 'zone': 1, 'weight': 2,
+                    'ip': '127.0.1.1', 'port': 10002, 'device': 'sda1'})
+        rb.add_dev({'id': 3, 'region': 0, 'zone': 1, 'weight': 2,
+                    'ip': '127.0.1.1', 'port': 10003, 'device': 'sdb1'})
+        rb.rebalance(seed=3)
 
-        rb.add_dev({'id': 2, 'region': 1, 'zone': 0, 'weight': 0.25,
-                    'ip': '127.0.0.1', 'port': 10003, 'device': 'sda1'})
-        rb.add_dev({'id': 3, 'region': 1, 'zone': 1, 'weight': 0.25,
-                    'ip': '127.0.0.1', 'port': 10004, 'device': 'sda1'})
+        rb.add_dev({'id': 4, 'region': 1, 'zone': 0, 'weight': 0.25,
+                    'ip': '127.0.2.1', 'port': 10004, 'device': 'sda1'})
+        rb.add_dev({'id': 5, 'region': 1, 'zone': 0, 'weight': 0.25,
+                    'ip': '127.0.2.1', 'port': 10005, 'device': 'sda1'})
+        rb.add_dev({'id': 6, 'region': 1, 'zone': 1, 'weight': 0.25,
+                    'ip': '127.0.3.1', 'port': 10006, 'device': 'sda1'})
+        rb.add_dev({'id': 7, 'region': 1, 'zone': 1, 'weight': 0.25,
+                    'ip': '127.0.3.1', 'port': 10007, 'device': 'sda1'})
         rb.pretend_min_part_hours_passed()
         changed_parts, _balance = rb.rebalance(seed=2)
 
         # there's not enough room in r1 for every partition to have a replica
-        # in it, so only 86 assignments occur in r1 (that's ~1/5 of the total,
-        # since r1 has 1/5 of the weight).
+        # in it, so only 88 assignments occur in r1 (that's ~1/9 of the total,
+        # since r1 has 1/9 of the weight).
         population_by_region = self._get_population_by_region(rb)
-        self.assertEquals(population_by_region, {0: 682, 1: 86})
+        self.assertEquals(population_by_region, {0: 680, 1: 88})
 
-        self.assertEqual(87, changed_parts)
+        self.assertEqual(88, changed_parts)
 
         # and since there's not enough room, subsequent rebalances will not
         # cause additional assignments to r1
         rb.pretend_min_part_hours_passed()
-        rb.rebalance(seed=2)
+        changed_parts, _balance = rb.rebalance(seed=2)
         population_by_region = self._get_population_by_region(rb)
-        self.assertEquals(population_by_region, {0: 682, 1: 86})
+        self.assertEquals(population_by_region, {0: 680, 1: 88})
 
         # after you add more weight, more partition assignments move
-        rb.set_dev_weight(2, 0.5)
-        rb.set_dev_weight(3, 0.5)
+        for dev in (4, 5, 6, 7):
+            rb.set_dev_weight(dev, 0.5)
         rb.pretend_min_part_hours_passed()
         rb.rebalance(seed=2)
         population_by_region = self._get_population_by_region(rb)
-        self.assertEquals(population_by_region, {0: 614, 1: 154})
+        self.assertEquals(population_by_region, {0: 612, 1: 156})
 
-        rb.set_dev_weight(2, 1.0)
-        rb.set_dev_weight(3, 1.0)
+        for dev in (4, 5, 6, 7):
+            rb.set_dev_weight(dev, 1.0)
         rb.pretend_min_part_hours_passed()
         rb.rebalance(seed=2)
         population_by_region = self._get_population_by_region(rb)
@@ -857,7 +865,7 @@ class TestRingBuilder(unittest.TestCase):
 
         # Number of partitions moved on each rebalance
         # 10/510 * 768 ~ 15.06 -> move at least 15 partitions in first step
-        ref = [0, 17, 16, 16, 14, 15, 13, 13, 12, 12, 14]
+        ref = [0, 17, 14, 14, 13, 13, 15, 14, 13, 13, 13]
         self.assertEqual(ref, moved_partitions)
 
     def test_no_duplicate_assignments(self):
@@ -1073,24 +1081,31 @@ class TestRingBuilder(unittest.TestCase):
                                    10: 64, 11: 64})
 
     def test_overload(self):
-        # XXX this'll need reworking; don't check this in without fixing it
-        from nose import SkipTest
-        raise SkipTest("needs more devices")
-
         rb = ring.RingBuilder(8, 3, 1)
-        rb.add_dev({'id': 0, 'region': 0, 'region': 0, 'zone': 0, 'weight': 1,
+        rb.add_dev({'id': 0, 'region': 0, 'zone': 0, 'weight': 1,
                     'ip': '127.0.0.1', 'port': 10000, 'device': 'sda'})
-        rb.add_dev({'id': 1, 'region': 0, 'region': 0, 'zone': 1, 'weight': 1,
+        rb.add_dev({'id': 1, 'region': 0, 'zone': 1, 'weight': 1,
                     'ip': '127.0.0.1', 'port': 10001, 'device': 'sdb'})
-        rb.add_dev({'id': 2, 'region': 0, 'region': 0, 'zone': 2, 'weight': 2,
+        rb.add_dev({'id': 2, 'region': 0, 'zone': 2, 'weight': 2,
+                    'ip': '127.0.0.2', 'port': 10002, 'device': 'sdc'})
+        rb.add_dev({'id': 3, 'region': 1, 'zone': 0, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10000, 'device': 'sda'})
+        rb.add_dev({'id': 4, 'region': 1, 'zone': 1, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10001, 'device': 'sdb'})
+        rb.add_dev({'id': 5, 'region': 1, 'zone': 2, 'weight': 2,
                     'ip': '127.0.0.2', 'port': 10002, 'device': 'sdc'})
         rb.rebalance(seed=12345)
 
         # sanity check: balance respects weights, so default
         part_counts = self._partition_counts(rb)
-        self.assertEqual(part_counts[0], 192)
-        self.assertEqual(part_counts[1], 192)
-        self.assertEqual(part_counts[2], 384)
+        self.assertEqual({
+            0: 96,
+            1: 96,
+            2: 192,
+            3: 96,
+            4: 96,
+            5: 192,
+        }, part_counts)
 
         # Devices 0 and 1 take 10% more than their fair shares by weight since
         # overload is 10% (0.1).
@@ -1100,9 +1115,14 @@ class TestRingBuilder(unittest.TestCase):
             rb.rebalance(seed=12345)
 
         part_counts = self._partition_counts(rb)
-        self.assertEqual(part_counts[0], 212)
-        self.assertEqual(part_counts[1], 212)
-        self.assertEqual(part_counts[2], 344)
+        self.assertEqual({
+            0: 106,
+            1: 106,
+            2: 172,
+            3: 106,
+            4: 106,
+            5: 172,
+        }, part_counts)
 
         # Now, devices 0 and 1 take 50% more than their fair shares by
         # weight.
