@@ -1135,19 +1135,19 @@ class TestRingBuilder(unittest.TestCase):
         # Overload doesn't prevent optimal balancing.
         rb = ring.RingBuilder(8, 3, 1)
         rb.set_overload(0.125)
-        rb.add_dev({'id': 0, 'region': 0, 'region': 0, 'zone': 0, 'weight': 1,
+        rb.add_dev({'id': 0, 'region': 0, 'zone': 0, 'weight': 1,
                     'ip': '127.0.0.1', 'port': 10000, 'device': 'sda'})
-        rb.add_dev({'id': 1, 'region': 0, 'region': 0, 'zone': 0, 'weight': 1,
+        rb.add_dev({'id': 1, 'region': 0, 'zone': 0, 'weight': 1,
                     'ip': '127.0.0.1', 'port': 10000, 'device': 'sdb'})
 
-        rb.add_dev({'id': 2, 'region': 0, 'region': 1, 'zone': 1, 'weight': 1,
+        rb.add_dev({'id': 3, 'region': 1, 'zone': 1, 'weight': 1,
                     'ip': '127.0.1.1', 'port': 10000, 'device': 'sda'})
-        rb.add_dev({'id': 3, 'region': 0, 'region': 1, 'zone': 1, 'weight': 1,
+        rb.add_dev({'id': 4, 'region': 1, 'zone': 1, 'weight': 1,
                     'ip': '127.0.1.1', 'port': 10000, 'device': 'sdb'})
 
-        rb.add_dev({'id': 4, 'region': 0, 'region': 2, 'zone': 2, 'weight': 2,
+        rb.add_dev({'id': 6, 'region': 2, 'zone': 2, 'weight': 2,
                     'ip': '127.0.2.1', 'port': 10000, 'device': 'sda'})
-        rb.add_dev({'id': 5, 'region': 0, 'region': 2, 'zone': 2, 'weight': 2,
+        rb.add_dev({'id': 7, 'region': 2, 'zone': 2, 'weight': 2,
                     'ip': '127.0.2.1', 'port': 10000, 'device': 'sdb'})
 
         rb.rebalance(seed=12346)
@@ -1158,40 +1158,29 @@ class TestRingBuilder(unittest.TestCase):
         self.assertEqual({
             0: 108,
             1: 108,
-            2: 108,
             3: 108,
-            4: 168,
-            5: 168,
+            4: 108,
+            6: 168,
+            7: 168,
         }, part_counts)
 
         # Add some weight: balance improves
         rb.set_dev_weight(0, 1.5)
         rb.set_dev_weight(1, 1.5)
-        rb.set_dev_weight(2, 1.5)
         rb.set_dev_weight(3, 1.5)
+        rb.set_dev_weight(4, 1.5)
 
-        rb.logger.debug("********************************************************************************")
         rb.pretend_min_part_hours_passed()
-        #__builtins__['tburke'] = 0
         rb.rebalance(seed=12345)
-        #rb.logger.debug("********************************************************************************")
-        #rb.pretend_min_part_hours_passed()
-        #rb.rebalance(seed=12345)
-        #rb.logger.debug("********************************************************************************")
-        #rb.pretend_min_part_hours_passed()
-
-        #rb.fucked = True
-
-        #rb.rebalance(seed=12345)
 
         part_counts = self._partition_counts(rb)
         self.assertEqual({
             0: 118,
             1: 118,
-            2: 118,
             3: 118,
-            4: 148,
-            5: 148,
+            4: 118,
+            6: 148,
+            7: 148,
         }, part_counts)
 
         # Even out the weights: balance becomes perfect
@@ -1207,22 +1196,19 @@ class TestRingBuilder(unittest.TestCase):
         self.assertEqual({
             0: 128,
             1: 128,
-            2: 128,
             3: 128,
             4: 128,
-            5: 128,
+            6: 128,
+            7: 128,
         }, part_counts)
 
         # Add some new devices: balance stays optimal
-        rb.add_dev({'id': 3, 'region': 0, 'region': 0, 'zone': 0,
-                    'weight': 2.0 / 3,
-                    'ip': '127.0.0.1', 'port': 10000, 'device': 'sdd'})
-        rb.add_dev({'id': 4, 'region': 0, 'region': 0, 'zone': 0,
-                    'weight': 2.0 / 3,
-                    'ip': '127.0.0.1', 'port': 10000, 'device': 'sde'})
-        rb.add_dev({'id': 5, 'region': 0, 'region': 0, 'zone': 0,
-                    'weight': 2.0 / 3,
-                    'ip': '127.0.0.1', 'port': 10000, 'device': 'sdf'})
+        rb.add_dev({'id': 2, 'region': 0, 'zone': 0, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10000, 'device': 'sdc'})
+        rb.add_dev({'id': 5, 'region': 1, 'zone': 1, 'weight': 1,
+                    'ip': '127.0.1.1', 'port': 10000, 'device': 'sdc'})
+        rb.add_dev({'id': 8, 'region': 2, 'zone': 2, 'weight': 1,
+                    'ip': '127.0.2.1', 'port': 10000, 'device': 'sdc'})
 
         # we're moving more than 1/3 of the replicas but fewer than 2/3, so
         # we have to do this twice
@@ -1232,12 +1218,17 @@ class TestRingBuilder(unittest.TestCase):
         rb.rebalance(seed=12345)
 
         part_counts = self._partition_counts(rb)
-        self.assertEqual(part_counts[0], 192)
-        self.assertEqual(part_counts[1], 192)
-        self.assertEqual(part_counts[2], 192)
-        self.assertEqual(part_counts[3], 64)
-        self.assertEqual(part_counts[4], 64)
-        self.assertEqual(part_counts[5], 64)
+        self.assertEqual({
+            0: 103,
+            1: 103,
+            2: 50,
+            3: 103,
+            4: 103,
+            5: 50,
+            6: 103,
+            7: 103,
+            8: 50,
+        }, part_counts)
 
     def test_overload_keeps_balanceable_things_balanced_initially(self):
         rb = ring.RingBuilder(8, 3, 1)
