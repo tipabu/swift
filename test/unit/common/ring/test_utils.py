@@ -644,10 +644,16 @@ class TestUtils(unittest.TestCase):
         rb = ring.RingBuilder(8, 3, 0)
         rb.add_dev({'id': 0, 'region': 1, 'zone': 0, 'weight': 100,
                     'ip': '127.0.0.0', 'port': 10000, 'device': 'sda1'})
+        rb.add_dev({'id': 3, 'region': 1, 'zone': 0, 'weight': 100,
+                    'ip': '127.0.0.0', 'port': 10001, 'device': 'sdb1'})
         rb.add_dev({'id': 1, 'region': 1, 'zone': 1, 'weight': 200,
-                    'ip': '127.0.0.1', 'port': 10001, 'device': 'sda1'})
+                    'ip': '127.0.0.1', 'port': 10002, 'device': 'sda1'})
+        rb.add_dev({'id': 4, 'region': 1, 'zone': 1, 'weight': 200,
+                    'ip': '127.0.0.1', 'port': 10003, 'device': 'sdb1'})
         rb.add_dev({'id': 2, 'region': 1, 'zone': 1, 'weight': 200,
-                    'ip': '127.0.0.2', 'port': 10002, 'device': 'sda1'})
+                    'ip': '127.0.0.2', 'port': 10004, 'device': 'sda1'})
+        rb.add_dev({'id': 5, 'region': 1, 'zone': 1, 'weight': 200,
+                    'ip': '127.0.0.2', 'port': 10005, 'device': 'sdb1'})
         rb.rebalance(seed=10)
 
         self.assertEqual(rb.dispersion, 39.84375)
@@ -673,11 +679,15 @@ class TestUtils(unittest.TestCase):
             ['r1z1-127.0.0.1', build_tier_report(
                 1, 256, 19.921875, [0, 205, 51, 0])],
             ['r1z1-127.0.0.1/sda1', build_tier_report(
-                1, 256, 19.921875, [0, 205, 51, 0])],
+                1, 154, 0, [102, 154, 0, 0])],
+            ['r1z1-127.0.0.1/sdb1', build_tier_report(
+                1, 153, 0, [103, 153, 0, 0])],
             ['r1z1-127.0.0.2', build_tier_report(
                 1, 256, 19.921875, [0, 205, 51, 0])],
             ['r1z1-127.0.0.2/sda1', build_tier_report(
-                1, 256, 19.921875, [0, 205, 51, 0])],
+                1, 154, 0, [102, 154, 0, 0])],
+            ['r1z1-127.0.0.2/sdb1', build_tier_report(
+                1, 153, 0, [103, 153, 0, 0])],
         ]
         report = dispersion_report(rb, 'r1z1.*', verbose=True)
         graph = report['graph']
@@ -686,14 +696,16 @@ class TestUtils(unittest.TestCase):
             self.assertEqual(expected[i][1], graph[i][1])
 
         # overcompensate in r1z0
-        rb.add_dev({'id': 3, 'region': 1, 'zone': 0, 'weight': 500,
-                    'ip': '127.0.0.1', 'port': 10003, 'device': 'sda1'})
+        rb.add_dev({'id': 6, 'region': 1, 'zone': 0, 'weight': 500,
+                    'ip': '127.0.0.1', 'port': 10006, 'device': 'sdc1'})
+        rb.add_dev({'id': 7, 'region': 1, 'zone': 0, 'weight': 500,
+                    'ip': '127.0.0.1', 'port': 10007, 'device': 'sdd1'})
         rb.rebalance(seed=10)
 
         report = dispersion_report(rb)
-        self.assertEqual(rb.dispersion, 40.234375)
+        self.assertAlmostEqual(rb.dispersion, 40, delta=1)
         self.assertEqual(report['worst_tier'], 'r1z0-127.0.0.1')
-        self.assertEqual(report['max_dispersion'], 30.078125)
+        self.assertAlmostEqual(report['max_dispersion'], 50, delta=1)
 
     def test_parse_address_old_format(self):
         # Test old format

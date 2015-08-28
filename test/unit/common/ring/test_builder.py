@@ -865,7 +865,7 @@ class TestRingBuilder(unittest.TestCase):
 
         # Number of partitions moved on each rebalance
         # 10/510 * 768 ~ 15.06 -> move at least 15 partitions in first step
-        ref = [0, 17, 14, 14, 13, 13, 15, 14, 13, 13, 13]
+        ref = [0, 16, 14, 14, 13, 13, 13, 12, 11, 12, 10]
         self.assertEqual(ref, moved_partitions)
 
     def test_no_duplicate_assignments(self):

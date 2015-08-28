@@ -1193,6 +1193,7 @@ class RingBuilder(object):
             depth += 1
 
         max_allowed_replicas = self._build_weighted_max_replicas_by_tier()
+        rand_for_tier = defaultdict(lambda: random.random())#randint(0, 0xFFFF))
         for part, replace_replicas in reassign_parts:
             # Gather up what other tiers (regions, zones, ip/ports, and
             # devices) the replicas not-to-be-moved are in for this part.
@@ -1216,7 +1217,7 @@ class RingBuilder(object):
                     (parts_available_in_tier[tier] + parts_in_tier[tier]),
                     # Prefer larger tiers
                     parts_available_in_tier[tier],
-                    random.random()])
+                    rand_for_tier[tier]])
 
             for replica in replace_replicas:
                 # Find a new home for this replica
@@ -1373,7 +1374,6 @@ class RingBuilder(object):
 
         tier2weight = {tiers_for_dev(d)[-1]: d['weight']
                        for d in self._iter_devs()}
-        tier2avg_sub_weight = {}
 
         def assign_weights(tier):
             total_weight = 0
@@ -1382,7 +1382,6 @@ class RingBuilder(object):
                 assign_weights(subtier)
                 total_weight += tier2weight[subtier]
             tier2weight.setdefault(tier, total_weight)
-            tier2avg_sub_weight[tier] = total_weight / (len(subtiers) or 1)
         assign_weights(())
 
         mr = defaultdict(float)
@@ -1400,6 +1399,14 @@ class RingBuilder(object):
                         tier2weight[subtier] / tier2weight[tier])
                 walk_tree(subtier)
         walk_tree(())
+
+        def cap_replicas(tier):
+            subtiers = tier2children.get(tier, [])
+            for subtier in subtiers:
+                cap_replicas(subtier)
+            mr[tier] = min(mr[tier], sum(mr[s] for s in subtiers) or 1)
+        cap_replicas(())
+
         return mr
 
     def _devs_for_part(self, part):
