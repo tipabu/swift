@@ -1088,23 +1088,14 @@ class TestRingBuilder(unittest.TestCase):
                     'ip': '127.0.0.1', 'port': 10001, 'device': 'sdb'})
         rb.add_dev({'id': 2, 'region': 0, 'zone': 2, 'weight': 2,
                     'ip': '127.0.0.2', 'port': 10002, 'device': 'sdc'})
-        rb.add_dev({'id': 3, 'region': 1, 'zone': 0, 'weight': 1,
-                    'ip': '127.0.0.1', 'port': 10000, 'device': 'sda'})
-        rb.add_dev({'id': 4, 'region': 1, 'zone': 1, 'weight': 1,
-                    'ip': '127.0.0.1', 'port': 10001, 'device': 'sdb'})
-        rb.add_dev({'id': 5, 'region': 1, 'zone': 2, 'weight': 2,
-                    'ip': '127.0.0.2', 'port': 10002, 'device': 'sdc'})
         rb.rebalance(seed=12345)
 
         # sanity check: balance respects weights, so default
         part_counts = self._partition_counts(rb)
         self.assertEqual({
-            0: 96,
-            1: 96,
-            2: 192,
-            3: 96,
-            4: 96,
-            5: 192,
+            0: 192,
+            1: 192,
+            2: 384,
         }, part_counts)
 
         # Devices 0 and 1 take 10% more than their fair shares by weight since
@@ -1116,12 +1107,9 @@ class TestRingBuilder(unittest.TestCase):
 
         part_counts = self._partition_counts(rb)
         self.assertEqual({
-            0: 106,
-            1: 106,
-            2: 172,
-            3: 106,
-            4: 106,
-            5: 172,
+            0: 212,
+            1: 212,
+            2: 344,
         }, part_counts)
 
         # Now, devices 0 and 1 take 50% more than their fair shares by
