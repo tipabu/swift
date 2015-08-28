@@ -1165,8 +1165,8 @@ class RingBuilder(object):
             # would be 0. This would happen any time a zone had any device
             # with partitions to shed, which is any time a device is being
             # removed, which is a pretty frequent operation.
-            wanted = max(dev['parts_wanted'], 0)
             fudge = self._n_overload_parts(dev)
+            wanted = max(dev['parts_wanted'], -fudge)
             self.logger.debug(
                 "Dev %(id)d has %(parts)d, wants %(parts_wanted)d", dev)
             for tier in tiers:
@@ -1287,7 +1287,6 @@ class RingBuilder(object):
                 for super_tier in (tier[:i] for i in range(len(tier) + 1)):
                     parts_available_in_tier[super_tier] -= 1
                     fudge_available_in_tier[super_tier] -= 1
-                    #max_allowed_replicas[super_tier] -= 1
                     parts_in_tier[super_tier] += 1
                     other_replicas[super_tier] += 1
                     occupied_tiers_by_tier_len[len(super_tier)].add(super_tier)
@@ -1359,6 +1358,7 @@ class RingBuilder(object):
 
         mr = defaultdict(float)
         mr[()] = float(self.replicas)
+
         def walk_tree(tier):
             subtiers = tier2children.get(tier, [])
             for subtier in subtiers:
@@ -1374,6 +1374,7 @@ class RingBuilder(object):
         tier2weight = {tiers_for_dev(d)[-1]: d['weight']
                        for d in self._iter_devs()}
         tier2avg_sub_weight = {}
+
         def assign_weights(tier):
             total_weight = 0
             subtiers = tier2children.get(tier, [])
@@ -1386,6 +1387,7 @@ class RingBuilder(object):
 
         mr = defaultdict(float)
         mr[()] = float(self.replicas)
+
         def walk_tree(tier):
             subtiers = tier2children.get(tier, [])
             for subtier in subtiers:

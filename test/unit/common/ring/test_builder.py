@@ -873,7 +873,6 @@ class TestRingBuilder(unittest.TestCase):
         # still don't assign two replicas of a partition to the same device.
         # It doesn't help anything.
         rb = ring.RingBuilder(8, 10, 1)  # e.g. 6+4 EC
-        #rb.set_overload(0.5)
 
         s1_weight = 4000
         s2_weight = 6000
@@ -1088,14 +1087,23 @@ class TestRingBuilder(unittest.TestCase):
                     'ip': '127.0.0.1', 'port': 10001, 'device': 'sdb'})
         rb.add_dev({'id': 2, 'region': 0, 'zone': 2, 'weight': 2,
                     'ip': '127.0.0.2', 'port': 10002, 'device': 'sdc'})
-        rb.rebalance(seed=12345)
+        rb.add_dev({'id': 3, 'region': 0, 'zone': 0, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10003, 'device': 'sda'})
+        rb.add_dev({'id': 4, 'region': 0, 'zone': 1, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10004, 'device': 'sdb'})
+        rb.add_dev({'id': 5, 'region': 0, 'zone': 2, 'weight': 2,
+                    'ip': '127.0.0.2', 'port': 10005, 'device': 'sdc'})
+        rb.rebalance(seed=12346)
 
         # sanity check: balance respects weights, so default
         part_counts = self._partition_counts(rb)
         self.assertEqual({
-            0: 192,
-            1: 192,
-            2: 384,
+            0: 96,
+            1: 96,
+            2: 192,
+            3: 96,
+            4: 96,
+            5: 192,
         }, part_counts)
 
         # Devices 0 and 1 take 10% more than their fair shares by weight since
@@ -1107,9 +1115,12 @@ class TestRingBuilder(unittest.TestCase):
 
         part_counts = self._partition_counts(rb)
         self.assertEqual({
-            0: 212,
-            1: 212,
-            2: 344,
+            0: 106,
+            1: 106,
+            2: 172,
+            3: 106,
+            4: 106,
+            5: 172,
         }, part_counts)
 
         # Now, devices 0 and 1 take 50% more than their fair shares by
@@ -1120,9 +1131,14 @@ class TestRingBuilder(unittest.TestCase):
             rb.rebalance(seed=12345)
 
         part_counts = self._partition_counts(rb)
-        self.assertEqual(part_counts[0], 256)
-        self.assertEqual(part_counts[1], 256)
-        self.assertEqual(part_counts[2], 256)
+        self.assertEqual({
+            0: 128,
+            1: 128,
+            2: 128,
+            3: 128,
+            4: 128,
+            5: 128,
+        }, part_counts)
 
         # Devices 0 and 1 may take up to 75% over their fair share, but the
         # placement algorithm only wants to spread things out evenly between
@@ -1133,9 +1149,14 @@ class TestRingBuilder(unittest.TestCase):
             rb.rebalance(seed=12345)
 
         part_counts = self._partition_counts(rb)
-        self.assertEqual(part_counts[0], 256)
-        self.assertEqual(part_counts[1], 256)
-        self.assertEqual(part_counts[2], 256)
+        self.assertEqual({
+            0: 128,
+            1: 128,
+            2: 128,
+            3: 128,
+            4: 128,
+            5: 128,
+        }, part_counts)
 
     def test_unoverload(self):
         # Start off needing overload to balance, then add capacity until we
