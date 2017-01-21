@@ -253,12 +253,15 @@ the manifest and the segments it's referring to) in the container and account
 metadata which can be used for stats purposes.
 """
 
+import base64
 from collections import defaultdict
 from datetime import datetime
+import itertools
 import json
 import mimetypes
 import re
 import six
+import time
 from hashlib import md5
 from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.swob import Request, HTTPBadRequest, HTTPServerError, \
@@ -281,6 +284,7 @@ from swift.common.middleware.bulk import get_response_body, \
 DEFAULT_RATE_LIMIT_UNDER_SIZE = 1024 * 1024  # 1 MiB
 DEFAULT_MAX_MANIFEST_SEGMENTS = 1000
 DEFAULT_MAX_MANIFEST_SIZE = 1024 * 1024 * 2  # 2 MiB
+DEFAULT_SEGMENT_LENGTH = 1024 * 1024 * 100  # 100 MiB
 
 
 REQUIRED_SLO_KEYS = set(['path'])
@@ -289,6 +293,7 @@ ALLOWED_SLO_KEYS = REQUIRED_SLO_KEYS | OPTIONAL_SLO_KEYS
 
 SYSMETA_SLO_ETAG = get_sys_meta_prefix('object') + 'slo-etag'
 SYSMETA_SLO_SIZE = get_sys_meta_prefix('object') + 'slo-size'
+SYSMETA_SLO_MD5 = get_sys_meta_prefix('object') + 'slo-content-md5'
 
 
 def parse_and_validate_input(req_body, req_path):
@@ -413,6 +418,42 @@ def parse_and_validate_input(req_body, req_path):
                              headers={"Content-Type": "text/plain"})
 
     return parsed_data
+
+
+class LengthLimitedReader(object):
+    def __init__(self, reader, max_length=DEFAULT_SEGMENT_LENGTH,
+                 checksum=None):
+        self._reader = reader
+        self._checksum = checksum
+        self._md5 = md5()
+        self._buffered_byte = self._reader.read(1)
+        self.at_least_one_byte = bool(self._buffered_byte)
+        self.max_length = max_length
+        self.bytes_read = 0
+
+    def read(self, size):
+        if size < 0:
+            size = self.max_length - self.bytes_read
+        elif size == 0:
+            return ''
+        else:
+            size = min(size, self.max_length - self.bytes_read)
+
+        if self._buffered_byte:
+            chunk = self._buffered_byte + self._reader.read(size - 1)
+            self._buffered_byte = ''
+        else:
+            chunk = self._reader.read(size)
+
+        self.bytes_read += len(chunk)
+        if self._checksum:
+            self._checksum.update(chunk)
+        self._md5.update(chunk)
+        return chunk
+
+    @property
+    def etag(self):
+        return self._md5.hexdigest()
 
 
 class SloGetContext(WSGIContext):
@@ -629,13 +670,15 @@ class SloGetContext(WSGIContext):
         resp_iter = self._app_call(req.environ)
 
         # make sure this response is for a static large object manifest
-        slo_marker = slo_etag = slo_size = None
+        slo_marker = slo_etag = slo_size = content_md5 = None
         for header, value in self._response_headers:
             header = header.lower()
             if header == SYSMETA_SLO_ETAG:
                 slo_etag = value
             elif header == SYSMETA_SLO_SIZE:
                 slo_size = value
+            elif header == SYSMETA_SLO_MD5:
+                content_md5 = value
             elif (header == 'x-static-large-object' and
                   config_true_value(value)):
                 slo_marker = value
@@ -680,6 +723,8 @@ class SloGetContext(WSGIContext):
                     self._response_headers[i] = (header, '"%s"' % slo_etag)
                 elif lheader == 'content-length' and not is_conditional:
                     self._response_headers[i] = (header, slo_size)
+            if content_md5:
+                self._response_headers.append(('Content-MD5', content_md5))
             start_response(self._response_status,
                            self._response_headers,
                            self._response_exc_info)
@@ -752,11 +797,14 @@ class SloGetContext(WSGIContext):
 
         slo_etag = None
         content_length = None
+        content_md5 = None
         response_headers = []
         for header, value in resp_headers:
             lheader = header.lower()
             if lheader == SYSMETA_SLO_ETAG:
                 slo_etag = value
+            elif lheader == SYSMETA_SLO_MD5:
+                content_md5 = value
             elif lheader == SYSMETA_SLO_SIZE:
                 # it's from sysmeta, so we don't worry about non-integer
                 # values here
@@ -782,6 +830,8 @@ class SloGetContext(WSGIContext):
 
         response_headers.append(('Content-Length', str(content_length)))
         response_headers.append(('Etag', '"%s"' % slo_etag))
+        if content_md5:
+            response_headers.append(('Content-MD5', content_md5))
 
         if req.method == 'HEAD':
             return self._manifest_head_response(req, response_headers)
@@ -871,12 +921,14 @@ class StaticLargeObject(object):
 
     def __init__(self, app, conf,
                  max_manifest_segments=DEFAULT_MAX_MANIFEST_SEGMENTS,
-                 max_manifest_size=DEFAULT_MAX_MANIFEST_SIZE):
+                 max_manifest_size=DEFAULT_MAX_MANIFEST_SIZE,
+                 streaming_segment_length=DEFAULT_SEGMENT_LENGTH):
         self.conf = conf
         self.app = app
         self.logger = get_logger(conf, log_route='slo')
         self.max_manifest_segments = max_manifest_segments
         self.max_manifest_size = max_manifest_size
+        self.streaming_segment_length = streaming_segment_length
         self.max_get_time = int(self.conf.get('max_get_time', 86400))
         self.rate_limit_under_size = int(self.conf.get(
             'rate_limit_under_size', DEFAULT_RATE_LIMIT_UNDER_SIZE))
@@ -902,6 +954,95 @@ class StaticLargeObject(object):
         :raises: HttpException on errors
         """
         return SloGetContext(self).handle_slo_get_or_head(req, start_response)
+
+    def handle_streaming_put(self, req, start_response):
+        try:
+            vrs, account, container, obj = req.split_path(1, 4, True)
+        except ValueError:
+            return self.app(req.environ, start_response)
+        on_disk_manifest = []
+        content_md5 = md5()
+        slo_etag = md5()
+        total_size = 0
+        if '/' not in req.params['stream-to'].strip('/'):
+            raise HTTPBadRequest('Query parameter "stream-to" must include '
+                                 'both container and object prefix, separated '
+                                 'by "/".\n')
+        segment_prefix = '%s/%d' % (req.params['stream-to'].strip('/'),
+                                    int(time.time()))
+        return_manifest_response = False
+        try:
+            segment_length = int(req.params.get(
+                'segment-length', self.streaming_segment_length))
+            if segment_length <= 0:
+                raise ValueError
+        except ValueError:
+            raise HTTPBadRequest('Query parameter "segment-length" must be '
+                                 'a positive integer.\n')
+
+        try:
+            for index in itertools.count():
+                seg_name = '%s/%06d' % (segment_prefix, index)
+                seg_path = '/'.join(['', vrs, account, seg_name])
+                seg_req = make_subrequest(
+                    req.environ, path=seg_path + '?',  # kill the query string
+                    headers={'x-auth-token': req.headers.get('x-auth-token'),
+                             'content-type': 'application/swift-segment',
+                             'transfer-encoding': 'chunked'},
+                    agent='%(orig)s SLO StreamingPUT', swift_source='SLO')
+                seg_data = LengthLimitedReader(req.environ['wsgi.input'],
+                                               max_length=segment_length,
+                                               checksum=content_md5)
+                if not seg_data.at_least_one_byte:
+                    break
+                if len(on_disk_manifest) >= self.max_manifest_segments:
+                    # We're about to write another segment; if we're already at
+                    # capacity, fail
+                    raise HTTPRequestEntityTooLarge(
+                        'Number of segments must be <= %d' %
+                        self.max_manifest_segments)
+                seg_req.environ['wsgi.input'] = seg_data
+                seg_resp = seg_req.get_response(self.app)
+                if not is_success(seg_resp.status_int):
+                    return seg_resp(req.environ, start_response)
+                slo_etag.update(seg_data.etag)
+                total_size += seg_data.bytes_read
+                on_disk_manifest.append({
+                    'name': '/' + seg_name,
+                    'bytes': seg_data.bytes_read,
+                    'hash': seg_data.etag,
+                    'content_type': 'application/swift-segment',
+                    'last_modified': seg_resp.last_modified.strftime(
+                        '%Y-%m-%dT%H:%M:%S.%f'),
+                })
+                if seg_resp.etag != seg_data.etag:
+                    # Yes, the final manifest should still include
+                    # the busted segment
+                    raise HTTPUnprocessibleEntity()
+            return_manifest_response = True
+        finally:
+            # Yes, always try to kick off a final request.
+            req.body = json.dumps(on_disk_manifest)
+            req.headers.update({
+                SYSMETA_SLO_ETAG: slo_etag.hexdigest(),
+                SYSMETA_SLO_SIZE: total_size,
+                SYSMETA_SLO_MD5: base64.b64encode(content_md5.digest()),
+                'X-Static-Large-Object': 'True',
+                'Etag': md5(req.body).hexdigest(),
+            })
+
+            env = req.environ
+            if not env.get('CONTENT_TYPE'):
+                guessed_type, _junk = mimetypes.guess_type(req.path_info)
+                env['CONTENT_TYPE'] = guessed_type or 'application/octet-stream'
+            env['swift.content_type_overridden'] = True
+            env['CONTENT_TYPE'] += ";swift_bytes=%d" % total_size
+
+            resp = req.get_response(self.app)
+            if return_manifest_response:
+                # But only *sometimes* return the response. If we're already
+                # returning/raising, we should continue with that
+                return resp(req.environ, start_response)
 
     def handle_multipart_put(self, req, start_response):
         """
@@ -1181,7 +1322,10 @@ class StaticLargeObject(object):
         try:
             if req.method == 'PUT' and \
                     req.params.get('multipart-manifest') == 'put':
-                return self.handle_multipart_put(req, start_response)
+                if 'stream-to' in req.params:
+                    return self.handle_streaming_put(req, start_response)
+                else:
+                    return self.handle_multipart_put(req, start_response)
             if req.method == 'DELETE' and \
                     req.params.get('multipart-manifest') == 'delete':
                 return self.handle_multipart_delete(req)(env, start_response)
@@ -1207,10 +1351,15 @@ def filter_factory(global_conf, **local_conf):
                                          DEFAULT_MAX_MANIFEST_SEGMENTS))
     max_manifest_size = int(conf.get('max_manifest_size',
                                      DEFAULT_MAX_MANIFEST_SIZE))
+    streaming_segment_length = int(conf.get('streaming_segment_length',
+                                            DEFAULT_SEGMENT_LENGTH))
+    if streaming_segment_length <= 0:
+        raise ValueError('streaming_segment_length must be a positive integer')
 
     register_swift_info('slo',
                         max_manifest_segments=max_manifest_segments,
                         max_manifest_size=max_manifest_size,
+                        streaming_segment_length=streaming_segment_length,
                         # this used to be configurable; report it as 1 for
                         # clients that might still care
                         min_segment_size=1)
@@ -1218,6 +1367,7 @@ def filter_factory(global_conf, **local_conf):
     def slo_filter(app):
         return StaticLargeObject(
             app, conf,
+            streaming_segment_length=streaming_segment_length,
             max_manifest_segments=max_manifest_segments,
             max_manifest_size=max_manifest_size)
     return slo_filter

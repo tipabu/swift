@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import email.parser
 import hashlib
 import itertools
@@ -34,6 +35,10 @@ def setUpModule():
 def tearDownModule():
     tf.teardown_package()
 
+
+def grouped_content(content):
+    return [(char, sum(1 for _char in grp))
+            for char, grp in itertools.groupby(content)]
 
 class TestSloEnv(BaseEnv):
     slo_enabled = None  # tri-state: None initially, then True/False
@@ -305,9 +310,6 @@ class TestSlo(Base):
 
     def test_slo_get_ranged_manifest(self):
         file_item = self.env.container.file('ranged-manifest')
-        grouped_file_contents = [
-            (char, sum(1 for _char in grp))
-            for char, grp in itertools.groupby(file_item.read())]
         self.assertEqual([
             ('c', 1),
             ('d', 1024 * 1024),
@@ -315,22 +317,16 @@ class TestSlo(Base):
             ('a', 512 * 1024),
             ('b', 512 * 1024),
             ('c', 1),
-            ('d', 1)], grouped_file_contents)
+            ('d', 1)], grouped_content(file_item.read()))
 
     def test_slo_get_ranged_manifest_repeated_segment(self):
         file_item = self.env.container.file('ranged-manifest-repeated-segment')
-        grouped_file_contents = [
-            (char, sum(1 for _char in grp))
-            for char, grp in itertools.groupby(file_item.read())]
         self.assertEqual(
             [('a', 2097152), ('b', 1048576)],
-            grouped_file_contents)
+            grouped_content(file_item.read()))
 
     def test_slo_get_ranged_submanifest(self):
         file_item = self.env.container.file('ranged-submanifest')
-        grouped_file_contents = [
-            (char, sum(1 for _char in grp))
-            for char, grp in itertools.groupby(file_item.read())]
         self.assertEqual([
             ('c', 1024 * 1024 + 1),
             ('d', 1024 * 1024),
@@ -343,7 +339,7 @@ class TestSlo(Base):
             ('a', 512 * 1024),
             ('b', 1),
             ('c', 1),
-            ('d', 1)], grouped_file_contents)
+            ('d', 1)], grouped_content(file_item.read()))
 
     def test_slo_ranged_get(self):
         file_item = self.env.container.file('manifest-abcde')
@@ -358,28 +354,22 @@ class TestSlo(Base):
         file_item = self.env.container.file('manifest-abcde')
         file_contents = file_item.read(
             hdrs={"Range": "bytes=1048571-"})
-        grouped_file_contents = [
-            (char, sum(1 for _char in grp))
-            for char, grp in itertools.groupby(file_contents)]
         self.assertEqual([
             ('a', 5),
             ('b', 1048576),
             ('c', 1048576),
             ('d', 1048576),
             ('e', 1)
-        ], grouped_file_contents)
+        ], grouped_content(file_contents))
 
     def test_slo_ranged_get_half_open_on_left(self):
         file_item = self.env.container.file('manifest-abcde')
         file_contents = file_item.read(
             hdrs={"Range": "bytes=-123456"})
-        grouped_file_contents = [
-            (char, sum(1 for _char in grp))
-            for char, grp in itertools.groupby(file_contents)]
         self.assertEqual([
             ('d', 123455),
             ('e', 1),
-        ], grouped_file_contents)
+        ], grouped_content(file_contents))
 
     def test_slo_multi_ranged_get(self):
         file_item = self.env.container.file('manifest-abcde')
@@ -1010,6 +1000,113 @@ class TestSlo(Base):
         self.assertEqual('b', contents[1024 * 1024])
         self.assertEqual('d', contents[-2])
         self.assertEqual('e', contents[-1])
+
+    def _test_streaming_slo(self, segment_size, segment_container=None):
+        segment_container = segment_container or self.env.container.name
+        file_item = self.env.container.file(Utils.create_name())
+        seg_prefix = '/%s/%s/segments' % (segment_container, file_item.name)
+        file_item.write(
+            b'a' * 1024,
+            parms={'multipart-manifest': 'put', 'stream-to': seg_prefix,
+                   'segment-length': segment_size})
+
+        got_body = file_item.read(parms={'multipart-manifest': 'get'})
+
+        self.assertEqual('application/json; charset=utf-8',
+                         file_item.content_type)
+        try:
+            manifest = json.loads(got_body)
+        except ValueError:
+            self.fail("GET with multipart-manifest=get got invalid json")
+
+        file_item.initialize(parms={'multipart-manifest': 'get'})
+        self.assertEqual(file_item.etag, hashlib.md5(got_body).hexdigest())
+
+        self.assertFalse([
+            item for item in manifest
+            if not item['name'].startswith(seg_prefix)])
+
+        file_item.initialize()
+        self.assertIn('content-md5', [h.lower() for h, v in file_item.headers])
+        self.assertEqual([base64.b64decode(v) for h, v in file_item.headers
+                          if h.lower() == 'content-md5'],
+                         [hashlib.md5(b'a' * 1024).digest()])
+
+        self.assertEqual(file_item.size,
+                         sum(item['bytes'] for item in manifest))
+        self.assertEqual(file_item.etag, hashlib.md5(''.join(
+            item['hash'] for item in manifest)).hexdigest())
+
+        full_segments, remainder = divmod(1024, segment_size)
+        if remainder:
+            self.assertEqual(full_segments + 1, len(manifest))
+            self.assertEqual([segment_size] * full_segments,
+                             [item['bytes'] for item in manifest[:-1]])
+            self.assertEqual(manifest[-1]['bytes'], remainder)
+        else:
+            self.assertEqual(full_segments, len(manifest))
+            self.assertEqual([segment_size] * full_segments,
+                             [item['bytes'] for item in manifest])
+
+        self.assertEqual([('a', 1024)], grouped_content(file_item.read()))
+
+    def test_streaming_slo(self):
+        # All fits in one segment
+        self._test_streaming_slo(1024)
+        # Just barely get to two segments
+        self._test_streaming_slo(1023)
+        # Check for fence-post issues
+        self._test_streaming_slo(256)
+        # Can stream across containers
+        self._test_streaming_slo(256, self.env.container2.name)
+
+    def test_streaming_slo_empty(self):
+        file_item = self.env.container.file(Utils.create_name())
+        seg_prefix = '/%s/%s/segments' % (file_item.container, file_item.name)
+        file_item.write('', parms={
+            'multipart-manifest': 'put',
+            'stream-to': seg_prefix})
+
+        # Yup, still creates a manifest
+        self.assertEqual('[]', file_item.read(parms={
+            'multipart-manifest': 'get'}))
+        self.assertEqual('application/json; charset=utf-8',
+                         file_item.content_type)
+
+        self.assertEqual('', file_item.read())
+
+    def test_streaming_slo_bad_length(self):
+        file_item = self.env.container.file(Utils.create_name())
+        seg_prefix = '/%s/%s/segments' % (file_item.container, file_item.name)
+        with self.assertRaises(ResponseError) as exc_mgr:
+            file_item.write('a', parms={
+                'multipart-manifest': 'put',
+                'stream-to': seg_prefix,
+                'segment-length': 'not a number'})
+        self.assertEqual(400, exc_mgr.exception.status)
+
+    def test_streaming_slo_bad_destination(self):
+        file_item = self.env.container.file(Utils.create_name())
+        with self.assertRaises(ResponseError) as exc_mgr:
+            file_item.write('a', parms={
+                'multipart-manifest': 'put',
+                'stream-to': 'not a real container/prefix'})
+        self.assertEqual(404, exc_mgr.exception.status)
+        # Manifest still gets written!
+        self.assertEqual('', file_item.read())
+
+        file_item2 = self.env.container.file(Utils.create_name())
+        file_item2.initialize()
+        self.assertEqual(None, file_item2.size)
+        with self.assertRaises(ResponseError) as exc_mgr:
+            file_item2.write('a', parms={
+                'multipart-manifest': 'put',
+                'stream-to': file_item.container})
+        self.assertEqual(400, exc_mgr.exception.status)
+        # 400 => no manifest
+        with self.assertRaises(ResponseError) as exc_mgr:
+            file_item2.read()
+        self.assertEqual(404, exc_mgr.exception.status)
 
 
 class TestSloUTF8(Base2, TestSlo):

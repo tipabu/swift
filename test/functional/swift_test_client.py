@@ -805,7 +805,9 @@ class File(Base):
             raise ResponseError(self.conn.response, 'HEAD',
                                 self.conn.make_path(self.path))
 
+        self.headers = []
         for hdr in self.conn.response.getheaders():
+            self.headers.append(hdr)
             if hdr[0].lower() == 'content-type':
                 self.content_type = hdr[1]
             if hdr[0].lower().startswith('x-object-meta-'):
