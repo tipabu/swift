@@ -166,7 +166,7 @@ def IOPRIO_PRIO_VALUE(class_, data):
 HASH_PATH_SUFFIX = b''
 HASH_PATH_PREFIX = b''
 
-SWIFT_CONF_FILE = '/etc/swift/swift.conf'
+SWIFT_CONF_FILE = os.environ.get('SWIFT_CONF_FILE', '/etc/swift/swift.conf')
 
 # These constants are Linux-specific, and Python doesn't seem to know
 # about them. We ask anyway just in case that ever gets fixed.

@@ -197,13 +197,8 @@ class Application(object):
                          DEFAULT_RECHECK_ACCOUNT_EXISTENCE))
         self.allow_account_management = \
             config_true_value(conf.get('allow_account_management', 'no'))
-        self.container_ring = container_ring or Ring(swift_dir,
-                                                     ring_name='container')
-        self.account_ring = account_ring or Ring(swift_dir,
-                                                 ring_name='account')
-        # ensure rings are loaded for all configured storage policies
-        for policy in POLICIES:
-            policy.load_ring(swift_dir)
+
+        self.load_rings(account_ring, container_ring)
         self.obj_controller_router = ObjectControllerRouter()
         self.memcache = memcache
         mimetypes.init(mimetypes.knownfiles +
@@ -292,6 +287,15 @@ class Application(object):
             allow_account_management=self.allow_account_management,
             account_autocreate=self.account_autocreate,
             **constraints.EFFECTIVE_CONSTRAINTS)
+
+    def load_rings(self, account_ring, container_ring):
+        self.container_ring = container_ring or Ring(self.swift_dir,
+                                                     ring_name='container')
+        self.account_ring = account_ring or Ring(self.swift_dir,
+                                                 ring_name='account')
+        # ensure rings are loaded for all configured storage policies
+        for policy in POLICIES:
+            policy.load_ring(self.swift_dir)
 
     def _make_policy_override(self, policy, conf, override_conf):
         label_for_policy = _label_for_policy(policy)
