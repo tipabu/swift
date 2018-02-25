@@ -1,12 +1,14 @@
 import errno
 import json
 import math
+import mimetypes
 import os
 from six.moves.urllib.parse import unquote
 
+from swift.common import swob
 from swift.common.constraints import valid_api_version
 from swift.common.exceptions import APIVersionError
-from swift.common.swob import HTTPOk, HTTPForbidden, HTTPNotFound
+from swift.common.request_helpers import is_sys_or_user_meta
 from swift.common.utils import split_path, public, Timestamp
 from swift.proxy.server import Application
 from swift.proxy.controllers.info import InfoController
@@ -35,20 +37,27 @@ class AccountController(Controller):
 
     def GET(self, req):
         try:
-            containers = os.listdir(self.app.path(self.account_name))
+            containers = os.listdir(self.app.datapath(self.account_name))
             meta = self.app.read_meta(self.account_name)
         except OSError as e:
-            self.app.logger.warning(e)
             if e.errno == errno.EACCES:
-                return HTTPForbidden(request=req)
+                return swob.HTTPForbidden(request=req)
             if e.errno == errno.ENOENT:
-                return HTTPNotFound(request=req)
+                return swob.HTTPNotFound(request=req)
             raise
-        resp = HTTPOk(
-            request=req, headers=meta, body=json.dumps([
-                {'name': c} for c in containers]),
+        container_list = []
+        for c in sorted(containers):
+             cm = self.app.read_meta(self.account_name, c)
+             container_list.append({
+                'name': c,
+                'count': cm['X-Container-Object-Count'],
+                'bytes': cm['X-Container-Bytes-Used'],
+                'last_modified': Timestamp(cm['X-Backend-Put-Timestamp']).isoformat,
+            })
+
+        resp = swob.HTTPOk(
+            request=req, headers=meta, body=json.dumps(container_list),
             content_type='application/json', charset='utf-8')
-        resp.last_modified = math.ceil(float(meta['X-PUT-Timestamp']))
         return resp
 
     def HEAD(self, req):
@@ -65,6 +74,106 @@ class AccountController(Controller):
     def DELETE(self, req):
         asdf
 
+class ContainerController(Controller):
+    # Must be lower-case; screw container sync
+    save_headers = ['x-container-read', 'x-container-write']
+
+    def __init__(self, app, account_name, container_name, **kwargs):
+        super(ContainerController, self).__init__(app)
+        self.account_name = unquote(account_name)
+        self.container_name = unquote(container_name)
+
+    def GET(self, req):
+        base = self.app.datapath(self.account_name, self.container_name)
+        try:
+            objects = []
+            for path, dirs, files in os.walk(base):
+                for f in files:
+                    f = os.path.join(path, f)[len(base) + 1:]
+                    fm = self.app.read_meta(self.account_name, self.container_name, f)
+                    self.app.logger.info(fm)
+                    objects.append({
+                        'name': f,
+                        'hash': fm['ETag'],
+                        'bytes': fm['Content-Length'],
+                        'content_type': fm['Content-Type'],
+                        'last_modified': Timestamp(fm['X-Timestamp']).isoformat,
+                    })
+            meta = self.app.read_meta(self.account_name, self.container_name)
+        except OSError as e:
+            if e.errno == errno.EACCES:
+                return swob.HTTPForbidden(request=req)
+            if e.errno == errno.ENOENT:
+                return swob.HTTPNotFound(request=req)
+            raise
+        meta['X-Backend-Timestamp'] = meta['X-Timestamp'] = req.headers.get(
+            'X-Timestamp', Timestamp.now().internal)
+        resp = swob.HTTPOk(
+            request=req, headers=meta, body=json.dumps(objects),
+            content_type='application/json', charset='utf-8')
+        resp.last_modified = math.ceil(float(meta['X-Backend-Put-Timestamp']))
+        return resp
+
+    def HEAD(self, req):
+        resp = self.GET(req)
+        resp.body = ''
+        return resp
+
+    def PUT(self, req):
+        created = True
+        try:
+            os.mkdir(self.app.datapath(self.account_name, self.container_name))
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+            created = False
+        return self.POST(req, created)
+
+    def POST(self, req, created=None):
+        meta = self.app.read_meta(self.account_name, self.container_name)
+        meta.update({
+            key: value for key, value in req.headers.items()
+            if key.lower() in self.save_headers
+            or is_sys_or_user_meta('container', key)
+        })
+        meta.setdefault('X-Container-Object-Count', '0')
+        meta.setdefault('X-Container-Bytes-Used', '0')
+        self.app.write_meta(meta, self.account_name, self.container_name)
+        if created is None:
+            return swob.HTTPNoContent(request=req)
+        elif created:
+            return swob.HTTPCreated(request=req)
+        else:
+            return swob.HTTPAccepted(request=req)
+
+    def DELETE(self, req):
+        try:
+            os.rmdir(self.app.datapath(self.account_name, self.container_name))
+        except OSError as e:
+            if e.errno in (errno.ENOTEMPTY, errno.ENOTDIR):
+                resp = swob.HTTPConflict(request=req)
+            elif e.errno == errno.ENOENT:
+                resp = swob.HTTPNotFound(request=req)
+            elif e.errno == errno.EACCES:
+                resp = swob.HTTPForbidden(request=req)
+            else:
+                raise
+        else:
+            resp = swob.HTTPNoContent(request=req)
+        self.app.logger.info('%r', resp.status_int)
+        if resp.status_int in (204, 404):
+            # Clean up metadata
+            container_metapath = self.app.metapath(self.account_name, self.container_name)
+            object_metadir = os.path.dirname(self.app.metapath(self.account_name, self.container_name, 'dummy'))
+            for op, p in (
+                    (os.unlink, container_metapath),
+                    (os.rmdir, object_metadir)):
+                try:
+                    op(p)
+                except OSError:
+                    pass
+        return resp
+
 class SIOApplication(Application):
     def __init__(self, conf, *args, **kwargs):
         super(SIOApplication, self).__init__(conf, *args, **kwargs)
@@ -73,8 +182,8 @@ class SIOApplication(Application):
             raise ValueError('root_dir must be an absolute path, not %r' %
                              self.root_dir)
 
-        os.stat(self.root_dir)  # ensure it exists
-        mkdirp(self.path('.__swift_metadata__'))
+        os.stat(self.root_dir)  # check that it exists
+        mkdirp(self._path('.__swift_metadata__'))
 
     def read_meta(self, account, container=None, obj=None):
         p = self.metapath(account, container, obj)
@@ -82,19 +191,40 @@ class SIOApplication(Application):
             fp = open(p, 'rb')
         except IOError as e:
             if e.errno == errno.ENOENT:
-                s = os.stat(self.datapath(account, container, obj))
+                p = self.datapath(account, container, obj)
+                s = os.stat(p)
+                # do we need x-backend-recheck-*-existence headers?
+                if not container:
+                    return {
+                        'X-Account-Bytes-Used': '0',
+                        'X-Account-Object-Count': '0',
+                        'X-Account-Container-Count': len(os.listdir(p)),
+                        # *Maybe* we fake out per-policy stats for the default policy?
+                        'X-Timestamp': '',
+                    }
                 if not obj:
                     return {
-                        'X-PUT-Timestamp': Timestamp(s.st_ctime).internal,
+                        'X-Backend-Put-Timestamp': Timestamp(s.st_ctime).internal,
+                        'X-Backend-Delete-Timestamp': '',
+                        'X-Backend-Status-Changed-At': '',
+                        'X-Container-Bytes-Used': '0',
+                        'X-Container-Object-Count': '0',
+                        # *Maybe* we fake out x-storage-policy/x-backend-storage-policy-index to be the default?
                     }
-                # TODO: if obj, at least try to guess content type from name
-                return {}
+                guessed_type, _junk = mimetypes.guess_type(obj)
+                return {
+                    'ETag': '',  # We're not opening this up just for meta
+                    'Content-Length': str(s.st_size),
+                    'X-Timestamp': Timestamp(s.st_mtime).internal,
+                    'Content-Type': guessed_type or 'application/octet-stream',
+                }
+            raise
         with fp:
             return json.load(fp)
 
     def write_meta(self, meta, account, container=None, obj=None):
         p = self.metapath(account, container, obj)
-        mkdirp(os.dirname(p))
+        mkdirp(os.path.dirname(p))
         with open(p, 'wb') as fp:
             json.dump(meta, fp)
 
@@ -107,7 +237,7 @@ class SIOApplication(Application):
             args = ('.__swift_metadata__', 'object', account, container, obj)
         else:
             raise ValueError('cannot specify obj without container')
-        return self.path(*args)
+        return self._path(*args)
 
     def datapath(self, account, container=None, obj=None):
         if container is None and obj is None:
@@ -118,9 +248,9 @@ class SIOApplication(Application):
             args = (account, container, obj)
         else:
             raise ValueError('cannot specify obj without container')
-        return self.path(*args)
+        return self._path(*args)
 
-    def path(self, *args):
+    def _path(self, *args):
         p = os.path.join(self.root_dir, *args)
         if any(x in ('.', '..', '') for x in p[1:].split('/')):
             raise ValueError('%r has invalid path components' % p)
@@ -148,7 +278,7 @@ class SIOApplication(Application):
         if obj and container and account:
             pass
         elif container and account:
-            pass
+            return ContainerController, d
         elif account and not container and not obj:
             return AccountController, d
         return None, d
