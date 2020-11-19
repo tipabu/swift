@@ -32,7 +32,7 @@ from swift.common.utils import Timestamp, encode_timestamps, \
     decode_timestamps, extract_swift_bytes, storage_directory, hash_path, \
     ShardRange, renamer, find_shard_range, MD5_OF_EMPTY_STRING, mkdirs, \
     get_db_files, parse_db_filename, make_db_file_path, split_path, \
-    RESERVED_BYTE
+    config_true_value, RESERVED_BYTE
 from swift.common.db import DatabaseBroker, utf8encode, BROKER_TIMEOUT, \
     zero_like, DatabaseAlreadyExists, SQLITE_ARG_LIMIT
 
@@ -1841,6 +1841,20 @@ class ContainerBroker(DatabaseBroker):
     def is_own_shard_range(self, shard_range):
         return shard_range.name == self.path
 
+    def sharding_enabled(self):
+        # NB all shards will by default have been created with
+        # X-Container-Sysmeta-Sharding set and will therefore be candidates for
+        # sharding, along with explicitly configured root containers.
+        sharding = self.metadata.get('X-Container-Sysmeta-Sharding')
+        if sharding and config_true_value(sharding[0]):
+            return True
+        # if broker has been marked deleted it will have lost sysmeta, but we
+        # still need to process the broker (for example, to shrink any shard
+        # ranges) so fallback to checking if it has any shard ranges
+        if self.get_shard_ranges():
+            return True
+        return False
+
     def enable_sharding(self, epoch):
         """
         Updates this broker's own shard range with the given epoch, sets its
@@ -2273,3 +2287,75 @@ class ContainerBroker(DatabaseBroker):
             index += 1
 
         return found_ranges, False
+
+    def audit_shard_ranges(self):
+        '''
+        Sanity check the shard range table.
+
+        At the moment, this is only valid for root containers.
+
+        :returns: a list of errors if any trouble is found
+        '''
+        errors = []
+        own_shard_range = self.get_own_shard_range()
+
+        if own_shard_range.state in (ShardRange.SHARDING, ShardRange.SHARDED):
+            shard_ranges = self.get_shard_ranges()
+            missing_ranges = find_missing_ranges(shard_ranges)
+            if missing_ranges:
+                errors.append(
+                    'missing range(s): %s' %
+                    ' '.join(['%s-%s' % (lower, upper)
+                              for lower, upper in missing_ranges]))
+
+        for state in ShardRange.STATES:
+            shard_ranges = self.get_shard_ranges(states=state)
+            overlaps = find_overlapping_ranges(shard_ranges)
+            for overlapping_ranges in overlaps:
+                errors.append(
+                    'overlapping ranges in state %s: %s' %
+                    (ShardRange.STATES[state],
+                     ' '.join(['%s-%s' % (sr.lower, sr.upper)
+                               for sr in overlapping_ranges])))
+        return errors
+
+
+def find_missing_ranges(shard_ranges):
+    """
+    Find any ranges in the entire object namespace that are not covered by any
+    shard range in the given list.
+
+    :param shard_ranges: A list of :class:`~swift.utils.ShardRange`
+    :return: a list of missing ranges
+    """
+    gaps = []
+    if not shard_ranges:
+        return ((ShardRange.MIN, ShardRange.MAX),)
+    if shard_ranges[0].lower > ShardRange.MIN:
+        gaps.append((ShardRange.MIN, shard_ranges[0].lower))
+    for first, second in zip(shard_ranges, shard_ranges[1:]):
+        if first.upper < second.lower:
+            gaps.append((first.upper, second.lower))
+    if shard_ranges[-1].upper < ShardRange.MAX:
+        gaps.append((shard_ranges[-1].upper, ShardRange.MAX))
+    return gaps
+
+
+def find_overlapping_ranges(shard_ranges):
+    """
+    Find all pairs of overlapping ranges in the given list.
+
+    :param shard_ranges: A list of :class:`~swift.utils.ShardRange`
+    :return: a set of tuples, each tuple containing ranges that overlap with
+        each other.
+    """
+    result = set()
+    for shard_range in shard_ranges:
+        overlapping = [sr for sr in shard_ranges
+                       if shard_range != sr and shard_range.overlaps(sr)]
+        if overlapping:
+            overlapping.append(shard_range)
+            overlapping.sort()
+            result.add(tuple(overlapping))
+
+    return result

@@ -166,8 +166,7 @@ from six.moves import input
 
 from swift.common.utils import Timestamp, get_logger, ShardRange
 from swift.container.backend import ContainerBroker, UNSHARDED
-from swift.container.sharder import make_shard_ranges, sharding_enabled, \
-    CleavingContext
+from swift.container.sharder import make_shard_ranges, CleavingContext
 
 
 def _load_and_validate_shard_data(args):
@@ -273,7 +272,7 @@ def show_shard_ranges(broker, args):
 
 
 def db_info(broker, args):
-    print('Sharding enabled = %s' % sharding_enabled(broker))
+    print('Sharding enabled = %s' % broker.sharding_enabled())
     own_sr = broker.get_own_shard_range(no_default=True)
     print('Own shard range: %s' %
           (json.dumps(dict(own_sr, state=own_sr.state_text),

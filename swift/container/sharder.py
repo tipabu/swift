@@ -47,21 +47,6 @@ CLEAVE_FAILED = 1
 CLEAVE_EMPTY = 2
 
 
-def sharding_enabled(broker):
-    # NB all shards will by default have been created with
-    # X-Container-Sysmeta-Sharding set and will therefore be candidates for
-    # sharding, along with explicitly configured root containers.
-    sharding = broker.metadata.get('X-Container-Sysmeta-Sharding')
-    if sharding and config_true_value(sharding[0]):
-        return True
-    # if broker has been marked deleted it will have lost sysmeta, but we still
-    # need to process the broker (for example, to shrink any shard ranges) so
-    # fallback to checking if it has any shard ranges
-    if broker.get_shard_ranges():
-        return True
-    return False
-
-
 def make_shard_ranges(broker, shard_data, shards_account_prefix):
     timestamp = Timestamp.now()
     shard_ranges = []
@@ -75,47 +60,6 @@ def make_shard_ranges(broker, shard_data, shards_account_prefix):
 
         shard_ranges.append(ShardRange(path, timestamp, **kwargs))
     return shard_ranges
-
-
-def find_missing_ranges(shard_ranges):
-    """
-    Find any ranges in the entire object namespace that are not covered by any
-    shard range in the given list.
-
-    :param shard_ranges: A list of :class:`~swift.utils.ShardRange`
-    :return: a list of missing ranges
-    """
-    gaps = []
-    if not shard_ranges:
-        return ((ShardRange.MIN, ShardRange.MAX),)
-    if shard_ranges[0].lower > ShardRange.MIN:
-        gaps.append((ShardRange.MIN, shard_ranges[0].lower))
-    for first, second in zip(shard_ranges, shard_ranges[1:]):
-        if first.upper < second.lower:
-            gaps.append((first.upper, second.lower))
-    if shard_ranges[-1].upper < ShardRange.MAX:
-        gaps.append((shard_ranges[-1].upper, ShardRange.MAX))
-    return gaps
-
-
-def find_overlapping_ranges(shard_ranges):
-    """
-    Find all pairs of overlapping ranges in the given list.
-
-    :param shard_ranges: A list of :class:`~swift.utils.ShardRange`
-    :return: a set of tuples, each tuple containing ranges that overlap with
-        each other.
-    """
-    result = set()
-    for shard_range in shard_ranges:
-        overlapping = [sr for sr in shard_ranges
-                       if shard_range != sr and shard_range.overlaps(sr)]
-        if overlapping:
-            overlapping.append(shard_range)
-            overlapping.sort()
-            result.add(tuple(overlapping))
-
-    return result
 
 
 def is_sharding_candidate(shard_range, threshold):
@@ -688,32 +632,11 @@ class ContainerSharder(ContainerReplicator):
         # This is the root container, and therefore the tome of knowledge,
         # all we can do is check there is nothing screwy with the ranges
         self._increment_stat('audit_root', 'attempted')
-        warnings = []
-        own_shard_range = broker.get_own_shard_range()
-
-        if own_shard_range.state in (ShardRange.SHARDING, ShardRange.SHARDED):
-            shard_ranges = broker.get_shard_ranges()
-            missing_ranges = find_missing_ranges(shard_ranges)
-            if missing_ranges:
-                warnings.append(
-                    'missing range(s): %s' %
-                    ' '.join(['%s-%s' % (lower, upper)
-                              for lower, upper in missing_ranges]))
-
-        for state in ShardRange.STATES:
-            shard_ranges = broker.get_shard_ranges(states=state)
-            overlaps = find_overlapping_ranges(shard_ranges)
-            for overlapping_ranges in overlaps:
-                warnings.append(
-                    'overlapping ranges in state %s: %s' %
-                    (ShardRange.STATES[state],
-                     ' '.join(['%s-%s' % (sr.lower, sr.upper)
-                               for sr in overlapping_ranges])))
-
-        if warnings:
+        errors = broker.audit_shard_ranges()
+        if errors:
             self.logger.warning(
                 'Audit failed for root %s (%s): %s',
-                broker.db_file, quote(broker.path), ', '.join(warnings))
+                broker.db_file, quote(broker.path), ', '.join(errors))
             self._increment_stat('audit_root', 'failure', statsd=True)
             return False
 
@@ -1641,7 +1564,7 @@ class ContainerSharder(ContainerReplicator):
             error = None
             try:
                 self._identify_sharding_candidate(broker, node)
-                if sharding_enabled(broker):
+                if broker.sharding_enabled():
                     self._increment_stat('visited', 'attempted')
                     self._process_broker(broker, node, part)
                     self._increment_stat('visited', 'success', statsd=True)

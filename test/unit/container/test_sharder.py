@@ -38,7 +38,7 @@ from swift.common import internal_client
 from swift.container import replicator
 from swift.container.backend import ContainerBroker, UNSHARDED, SHARDING, \
     SHARDED, DATADIR
-from swift.container.sharder import ContainerSharder, sharding_enabled, \
+from swift.container.sharder import ContainerSharder, \
     CleavingContext, DEFAULT_SHARD_SHRINK_POINT, \
     DEFAULT_SHARD_CONTAINER_THRESHOLD
 from swift.common.utils import ShardRange, Timestamp, hash_path, \
@@ -3848,18 +3848,18 @@ class TestSharder(BaseTestSharder):
 
     def test_sharding_enabled(self):
         broker = self._make_broker()
-        self.assertFalse(sharding_enabled(broker))
+        self.assertFalse(broker.sharding_enabled())
         broker.update_metadata(
             {'X-Container-Sysmeta-Sharding':
              ('yes', Timestamp.now().internal)})
-        self.assertTrue(sharding_enabled(broker))
+        self.assertTrue(broker.sharding_enabled())
         # deleting broker clears sharding sysmeta
         broker.delete_db(Timestamp.now().internal)
-        self.assertFalse(sharding_enabled(broker))
+        self.assertFalse(broker.sharding_enabled())
         # but if broker has a shard range then sharding is enabled
         broker.merge_shard_ranges(
             ShardRange('acc/a_shard', Timestamp.now(), 'l', 'u'))
-        self.assertTrue(sharding_enabled(broker))
+        self.assertTrue(broker.sharding_enabled())
 
     def test_send_shard_ranges(self):
         shard_ranges = self._make_shard_ranges((('', 'h'), ('h', '')))
