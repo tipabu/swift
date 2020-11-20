@@ -2292,19 +2292,50 @@ class ContainerBroker(DatabaseBroker):
         '''
         Sanity check the shard range table.
 
-        At the moment, this is only valid for root containers.
-
         :returns: a list of errors if any trouble is found
         '''
         errors = []
         own_shard_range = self.get_own_shard_range()
-
-        if own_shard_range.state in (ShardRange.SHARDING, ShardRange.SHARDED):
-            shard_ranges = self.get_shard_ranges()
-            missing_ranges = find_missing_ranges(shard_ranges)
+        if own_shard_range.state == ShardRange.SHARDING and \
+                self.is_root_container():
+            # NB: shards may be marked sharding before identifying subshards
+            coverage_states = (ShardRange.FOUND, ShardRange.CREATED,
+                               ShardRange.CLEAVED, ShardRange.ACTIVE)
+            shard_ranges = self.get_shard_ranges(states=coverage_states)
+            missing_ranges = find_missing_ranges(shard_ranges, own_shard_range)
             if missing_ranges:
                 errors.append(
-                    'missing range(s): %s' %
+                    'missing range(s) for sharding: %s' %
+                    ' '.join(['%s-%s' % (lower, upper)
+                              for lower, upper in missing_ranges]))
+
+        elif own_shard_range.state in (ShardRange.SHARDED, ShardRange.SHRINKING):
+            shard_ranges = self.get_shard_ranges()
+
+            missing_ranges = find_missing_ranges([
+                sr for sr in shard_ranges if sr.state in SHARD_STATS_STATES
+            ], own_shard_range)
+            if missing_ranges:
+                errors.append(
+                    'missing range(s) for stats: %s' %
+                    ' '.join(['%s-%s' % (lower, upper)
+                              for lower, upper in missing_ranges]))
+
+            missing_ranges = find_missing_ranges([
+                sr for sr in shard_ranges if sr.state in SHARD_LISTING_STATES
+            ], own_shard_range)
+            if missing_ranges:
+                errors.append(
+                    'missing range(s) for listings: %s' %
+                    ' '.join(['%s-%s' % (lower, upper)
+                              for lower, upper in missing_ranges]))
+
+            missing_ranges = find_missing_ranges([
+                sr for sr in shard_ranges if sr.state in SHARD_UPDATE_STATES
+            ], own_shard_range)
+            if missing_ranges:
+                errors.append(
+                    'missing range(s) for updates: %s' %
                     ' '.join(['%s-%s' % (lower, upper)
                               for lower, upper in missing_ranges]))
 
@@ -2320,24 +2351,25 @@ class ContainerBroker(DatabaseBroker):
         return errors
 
 
-def find_missing_ranges(shard_ranges):
+def find_missing_ranges(shard_ranges, own_shard_range):
     """
-    Find any ranges in the entire object namespace that are not covered by any
+    Find any ranges in an object namespace that are not covered by any
     shard range in the given list.
 
-    :param shard_ranges: A list of :class:`~swift.utils.ShardRange`
-    :return: a list of missing ranges
+    :param shard_ranges: An in-order list of :class:`~swift.utils.ShardRange`
+    :param own_shard_range: The shard range that needs to be covered
+    :return: a list of missing (lower, upper) ranges
     """
     gaps = []
     if not shard_ranges:
-        return ((ShardRange.MIN, ShardRange.MAX),)
-    if shard_ranges[0].lower > ShardRange.MIN:
-        gaps.append((ShardRange.MIN, shard_ranges[0].lower))
+        return ((own_shard_range.lower, own_shard_range.upper),)
+    if shard_ranges[0].lower > own_shard_range.lower:
+        gaps.append((own_shard_range.lower, shard_ranges[0].lower))
     for first, second in zip(shard_ranges, shard_ranges[1:]):
         if first.upper < second.lower:
             gaps.append((first.upper, second.lower))
-    if shard_ranges[-1].upper < ShardRange.MAX:
-        gaps.append((shard_ranges[-1].upper, ShardRange.MAX))
+    if shard_ranges[-1].upper < own_shard_range.upper:
+        gaps.append((shard_ranges[-1].upper, own_shard_range.upper))
     return gaps
 
 

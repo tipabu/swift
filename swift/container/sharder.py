@@ -647,7 +647,7 @@ class ContainerSharder(ContainerReplicator):
         # Get the root view of the world.
         self._increment_stat('audit_shard', 'attempted')
         warnings = []
-        errors = []
+        errors = broker.audit_shard_ranges()
         if not broker.account.startswith(self.shards_account_prefix):
             warnings.append('account not in shards namespace %r' %
                             self.shards_account_prefix)
