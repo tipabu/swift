@@ -2340,6 +2340,11 @@ class ContainerBroker(DatabaseBroker):
                               for lower, upper in missing_ranges]))
 
         for state in ShardRange.STATES:
+            if state == ShardRange.SHRINKING:
+                # Shrinking is how we resolve overlaps; we've got to allow
+                # multiple shards in that state in case we have to resolve
+                # a three-way split-brain
+                continue
             shard_ranges = self.get_shard_ranges(states=state)
             overlaps = find_overlapping_ranges(shard_ranges)
             for overlapping_ranges in overlaps:
