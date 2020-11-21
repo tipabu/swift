@@ -1294,6 +1294,8 @@ class ContainerSharder(ContainerReplicator):
         for shard_range in ranges_todo:
             if shard_range.state == ShardRange.FOUND:
                 break
+            elif shard_range.state == ShardRange.SHRINKING:
+                continue
             elif shard_range.state in (ShardRange.CREATED,
                                        ShardRange.CLEAVED,
                                        ShardRange.ACTIVE):
