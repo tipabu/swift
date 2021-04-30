@@ -17,11 +17,15 @@
 
 from argparse import Namespace
 import errno
+import json
 import logging
+import signal
 import socket
+import struct
 import unittest
 import os
 import types
+import eventlet
 import eventlet.wsgi
 
 from collections import defaultdict
@@ -1484,6 +1488,48 @@ class CommonTestMixin(object):
         self.assertEqual([
             mock.call(self.logger),
         ], mock_capture.mock_calls)
+
+    def test_stale_pid_loading(self):
+        notify_rfd, notify_wfd = os.pipe()
+        state_rfd, state_wfd = os.pipe()
+        stale_process_data = {
+            "old_pids": [123, 456, 78, 90],
+        }
+        to_write = json.dumps(stale_process_data).encode('ascii')
+        os.write(state_wfd, struct.pack('!I', len(to_write)) + to_write)
+        os.close(state_wfd)
+        self.assertEqual(self.strategy.reload_pids, set())
+        os.environ['__SWIFT_SERVER_NOTIFY_FD'] = '%d,%d' % (
+            notify_wfd, state_rfd)
+        with mock.patch('swift.common.wsgi.capture_stdio'), \
+                mock.patch('swift.common.wsgi.sleep') as mock_sleep, \
+                mock.patch('swift.common.utils.get_ppid') as mock_ppid, \
+                mock.patch('os.kill') as mock_kill:
+            mock_ppid.side_effect = [
+                os.getpid(),
+                OSError(errno.ENOENT, "Not there"),
+                OSError(errno.EPERM, "Not for you"),
+                os.getpid(),
+            ]
+            self.strategy.signal_ready()
+            self.assertEqual(self.strategy.reload_pids, {123, 456, 78, 90})
+
+            # We spawned our child-killer, but it hasn't been scheduled yet
+            self.assertEqual(mock_ppid.mock_calls, [])
+            self.assertEqual(mock_sleep.mock_calls, [])
+            self.assertEqual(mock_kill.mock_calls, [])
+
+            # *Now* we let it run (with mocks still enabled)
+            eventlet.sleep()
+
+        self.assertEqual(str(os.getpid()).encode('ascii'),
+                         os.read(notify_rfd, 30))
+        os.close(notify_rfd)
+
+        self.assertEqual(mock_kill.mock_calls, [
+            mock.call(123, signal.SIGKILL),
+            mock.call(90, signal.SIGKILL)])
+        self.assertEqual(mock_sleep.mock_calls, [mock.call(7200)])
 
 
 class TestServersPerPortStrategy(unittest.TestCase, CommonTestMixin):
