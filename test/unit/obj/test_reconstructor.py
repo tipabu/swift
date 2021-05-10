@@ -42,6 +42,7 @@ from swift.common import ring
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          POLICIES, EC_POLICY)
 from swift.obj.reconstructor import SYNC, REVERT
+from swift.obj.ssync_sender import SsyncAbortDataFile
 from test import annotate_failure
 
 from test.debug_logger import debug_logger
@@ -5523,6 +5524,43 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         got_frag_index_list = json.loads(
             debug_log_lines[1][len(log_prefix):])
         self.assertNotIn(broken_index, got_frag_index_list)
+
+    def test_reconstruct_fa_finds_missing_frag_on_last_primary(self):
+        # verify that reconstruction of a missing frag can cope with finding
+        # that missing frag in the responses it gets from other nodes while
+        # attempting to rebuild the missing frag
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        index_to_reconstruct = random.randint(0, self.policy.ec_ndata - 1)
+        node = part_nodes[index_to_reconstruct]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+        self.policy.object_ring._last_part2dev_id = [[index_to_reconstruct]]
+
+        headers = {
+            'X-Object-Sysmeta-EC-Frag-Index': str(index_to_reconstruct),
+            'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+        }
+
+        with mocked_http_conn(200, body=b'', headers=headers), \
+                self.assertRaises(SsyncAbortDataFile):
+            self.reconstructor.reconstruct_fa(
+                job, node, self._create_fragment(2))
+
+        # no error, no warning
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+        # the found last-primary frag will be reported as a debug message
+        debug_log_lines = self.logger.get_lines_for_level('debug')
+        self.assertIn(
+            'Found existing frag #%s at last primary' % index_to_reconstruct,
+            debug_log_lines[0], debug_log_lines)
+        self.assertIn(
+            'waiting to let it revert from there',
+            debug_log_lines[0], debug_log_lines)
+        self.assertFalse(debug_log_lines[1:])
 
     def test_quarantine_threshold_conf(self):
         reconstructor = object_reconstructor.ObjectReconstructor({})

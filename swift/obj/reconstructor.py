@@ -40,7 +40,7 @@ from swift.common.bufferedhttp import http_connect
 from swift.common.daemon import Daemon
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.common.ring.utils import is_local_device
-from swift.obj.ssync_sender import Sender as ssync_sender
+from swift.obj.ssync_sender import Sender as ssync_sender, SsyncAbortDataFile
 from swift.common.http import HTTP_OK, HTTP_NOT_FOUND, \
     HTTP_INSUFFICIENT_STORAGE
 from swift.obj.diskfile import DiskFileRouter, get_data_dir, \
@@ -377,16 +377,18 @@ class ObjectReconstructor(Daemon):
                 return False
         return True
 
-    def _get_response(self, node, policy, partition, path, headers):
+    def _get_response(self, node, policy, partition, path, headers,
+                      method="GET"):
         """
         Helper method for reconstruction that GETs a single EC fragment
         archive
 
-        :param node: the node to GET from
+        :param node: the node to GET/HEAD from
         :param policy: the job policy
         :param partition: the partition
         :param path: path of the desired EC archive relative to partition dir
         :param headers: the headers to send
+        :param method: the request method to send
         :returns: response
         """
         full_path = _full_path(node, partition, path, policy)
@@ -395,7 +397,7 @@ class ObjectReconstructor(Daemon):
             with ConnectionTimeout(self.conn_timeout):
                 conn = http_connect(
                     node['replication_ip'], node['replication_port'],
-                    node['device'], partition, 'GET', path, headers=headers)
+                    node['device'], partition, method, path, headers=headers)
             with Timeout(self.node_timeout):
                 resp = conn.getresponse()
                 resp.full_path = full_path
@@ -492,6 +494,58 @@ class ObjectReconstructor(Daemon):
 
         return bucket
 
+    def _handle_last_primary(self, node, policy, partition, fi_to_rebuild,
+                             local_timestamp, path, headers):
+        last_part_node = policy.object_ring.get_last_part_node(partition)
+        if not last_part_node:
+            return
+
+        resp = self._get_response(last_part_node, policy, partition, path,
+                                  headers, 'HEAD')
+        if not resp:
+            return
+
+        if resp.status not in [HTTP_OK, HTTP_NOT_FOUND]:
+            self.logger.warning(
+                _("Invalid response %(resp)s from %(full_path)s"),
+                {'resp': resp.status, 'full_path': resp.full_path})
+        if resp.status != HTTP_OK:
+            return
+
+        resp.headers = HeaderKeyDict(resp.getheaders())
+        frag_index = resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
+        try:
+            resp_frag_index = int(frag_index)
+        except (TypeError, ValueError):
+            # The successful response should include valid X-Object-
+            # Sysmeta-Ec-Frag-Index but for safety, catching the case either
+            # missing X-Object-Sysmeta-Ec-Frag-Index or invalid frag index to
+            # reconstruct and dump warning log for that
+            self.logger.warning(
+                'Invalid resp from %s '
+                '(invalid X-Object-Sysmeta-Ec-Frag-Index: %r)',
+                resp.full_path, frag_index)
+            return
+
+        timestamp = resp.headers.get('X-Backend-Data-Timestamp',
+                                     resp.headers.get('X-Backend-Timestamp'))
+        if not timestamp:
+            self.logger.warning(
+                'Invalid resp from %s, frag index %s (missing '
+                'X-Backend-Data-Timestamp and X-Backend-Timestamp)',
+                resp.full_path, resp_frag_index)
+            return
+        timestamp = Timestamp(timestamp)
+
+        if (resp_frag_index, timestamp) == (fi_to_rebuild, local_timestamp):
+            self.logger.debug(
+                'Found existing frag #%s at last primary %s while rebuilding '
+                'to %s; waiting to let it revert from there',
+                fi_to_rebuild, resp.full_path,
+                _full_path(node, partition, path, policy))
+            self.logger.increment('found.last_node')
+            raise SsyncAbortDataFile('Letting handoff deal with it')
+
     def _is_quarantine_candidate(self, policy, buckets, error_responses, df):
         # This condition is deliberately strict because it determines if
         # more requests will be issued and ultimately if the fragment
@@ -558,6 +612,9 @@ class ObjectReconstructor(Daemon):
         frag_prefs = [{'timestamp': local_timestamp.normal, 'exclude': []}]
         headers['X-Backend-Fragment-Preferences'] = json.dumps(frag_prefs)
         path = datafile_metadata['name']
+
+        self._handle_last_primary(node, policy, partition, fi_to_rebuild,
+                                  local_timestamp, path, headers)
 
         ring = policy.object_ring
         primary_nodes = ring.get_part_nodes(partition)

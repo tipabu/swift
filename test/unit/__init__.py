@@ -228,7 +228,9 @@ class FakeRing(Ring):
         self.reload_time = reload_time
         self.set_replicas(replicas)
         self._next_part_power = next_part_power
+        self._last_part2dev_id = None
         self._reload()
+        self.none_dev_id = 255
 
     def has_changed(self):
         """

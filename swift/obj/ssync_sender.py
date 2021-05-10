@@ -22,6 +22,10 @@ from swift.common import http
 from swift.common.utils import config_true_value
 
 
+class SsyncAbortDataFile(Exception):
+    pass
+
+
 def encode_missing(object_hash, ts_data, ts_meta=None, ts_ctype=None,
                    **kwargs):
     """
@@ -382,6 +386,12 @@ class Sender(object):
             except exceptions.DiskFileDeleted as err:
                 if want.get('data'):
                     self.send_delete(connection, url_path, err.timestamp)
+            except SsyncAbortDataFile:
+                # The sync_diskfile_builder callback has decided in it's
+                # wisdom to not send this datafile. This could be because
+                # it was found it on a handoff already and so we want
+                # to bail and let them deal with it.
+                pass
             except exceptions.DiskFileError:
                 # DiskFileErrors are expected while opening the diskfile,
                 # before any data is read and sent. Since there is no partial
