@@ -861,11 +861,16 @@ class TestRingBuilder(unittest.TestCase):
         rb.add_dev({'id': 2, 'region': 0, 'zone': 2, 'weight': 1,
                     'ip': '127.0.0.1', 'port': 10002, 'device': 'sda1'})
         self.assertFalse(rb.ever_rebalanced)
+        self.assertIsNone(rb._last_part2dev)
         builder_file = os.path.join(self.testdir, 'test.buider')
         rb.save(builder_file)
         rb = ring.RingBuilder.load(builder_file)
         self.assertFalse(rb.ever_rebalanced)
         rb.rebalance()
+        # last_part2dev should be none because this is the first rebalance so
+        # so no old_replica2part2dev exists to be sent to
+        # _build_dispersion_graph
+        self.assertIsNone(rb._last_part2dev)
         self.assertTrue(rb.ever_rebalanced)
         rb.save(builder_file)
         rb = ring.RingBuilder.load(builder_file)
@@ -882,6 +887,11 @@ class TestRingBuilder(unittest.TestCase):
         self.assertFalse(rb.ever_rebalanced)
         rb.rebalance()
         self.assertTrue(rb.ever_rebalanced)
+
+        # last_part2dev should be none because this is the first rebalance so
+        # so no old_replica2part2dev exists to be sent to
+        # _build_dispersion_graph
+        self.assertIsNone(rb._last_part2dev)
         counts = _partition_counts(rb)
         self.assertEqual(counts, {0: 256, 1: 256, 2: 256})
         rb.add_dev({'id': 3, 'region': 0, 'zone': 3, 'weight': 1,
@@ -891,10 +901,19 @@ class TestRingBuilder(unittest.TestCase):
         self.assertTrue(rb.ever_rebalanced)
         counts = _partition_counts(rb)
         self.assertEqual(counts, {0: 192, 1: 192, 2: 192, 3: 192})
+
+        # we now have some parts moved so it isn't all NONE_DEVs any more
+        # maybe we need to find a rebalance seed that works for both
+        # py2 and py3
+        expected_last_part2dev = array(
+            'H', itertools.repeat(utils.none_dev_id(2), rb.parts))
+        self.assertNotEqual(expected_last_part2dev, rb._last_part2dev)
+        old_last_part2dev = rb._last_part2dev
         rb.set_dev_weight(3, 100)
         rb.rebalance()
         counts = _partition_counts(rb)
         self.assertEqual(counts[3], 256)
+        self.assertNotEqual(old_last_part2dev, rb._last_part2dev)
 
     def test_add_rebalance_add_rebalance_delete_rebalance(self):
         # Test for https://bugs.launchpad.net/swift/+bug/845952
@@ -2057,6 +2076,7 @@ class TestRingBuilder(unittest.TestCase):
         self.maxDiff = None
         self.assertEqual(loaded_rb.to_dict(), rb.to_dict())
         self.assertEqual(loaded_rb.overload, 3.14159)
+        self.assertEqual(loaded_rb._last_part2dev, rb._last_part2dev)
 
     @mock.patch('six.moves.builtins.open', autospec=True)
     @mock.patch('swift.common.ring.builder.pickle.dump', autospec=True)

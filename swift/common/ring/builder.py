@@ -112,6 +112,11 @@ class RingBuilder(object):
         # a while ago, code-wise, when I last tried it).
         self._replica2part2dev = None
 
+        # This is another array containing, like a single part2dev that holds
+        # the details of the last primary to own a part. This helps us to
+        # know what device used to own a part before the last rebalance.
+        self._last_part2dev = None
+
         # _last_part_moves is an array of unsigned bytes representing
         # the number of hours since a given partition was last moved.
         # This is used to guarantee we don't move a partition twice
@@ -261,6 +266,7 @@ class RingBuilder(object):
             self._remove_devs = builder._remove_devs
             self._id = getattr(builder, '_id', None)
             self.dev_id_bytes = getattr(builder, 'dev_id_bytes', 2)
+            self._last_part2dev = getattr(builder, '_last_part2dev', None)
         else:
             self.part_power = builder['part_power']
             self.next_part_power = builder.get('next_part_power')
@@ -284,6 +290,7 @@ class RingBuilder(object):
             self._remove_devs = builder['_remove_devs']
             self._id = builder.get('id')
             self.dev_id_bytes = builder.get('dev_id_bytes', 2)
+            self._last_part2dev = builder.get('_last_part2dev')
         self._ring = None
 
         # Old builders may not have a region defined for their devices, in
@@ -318,6 +325,7 @@ class RingBuilder(object):
                 '_last_part_moves_epoch': self._last_part_moves_epoch,
                 '_last_part_moves': self._last_part_moves,
                 '_last_part_gather_start': self._last_part_gather_start,
+                '_last_part2dev': self._last_part2dev,
                 '_dispersion_graph': self._dispersion_graph,
                 'dispersion': self.dispersion,
                 '_remove_devs': self._remove_devs,
@@ -383,14 +391,15 @@ class RingBuilder(object):
             # int).
             if not self._replica2part2dev:
                 self._ring = RingData([], devs, self.part_shift,
-                                      version=self.version)
+                                      version=self.version,
+                                      last_part2dev_id=self._last_part2dev)
             else:
                 self._ring = \
                     RingData([array(self.dev_id_type_code, p2d) for p2d in
                               self._replica2part2dev],
                              devs, self.part_shift,
                              self.next_part_power,
-                             self.version)
+                             self.version, self._last_part2dev)
         return self._ring
 
     def add_dev(self, dev):
@@ -439,6 +448,10 @@ class RingBuilder(object):
             self._replica2part2dev = [
                 resized_array(p2d, new_dev_id_bytes)
                 for p2d in self._replica2part2dev]
+            if self._last_part2dev:
+                self._last_part2dev = [
+                    resize_array(p2d, new_dev_id_bytes)
+                    for p2d in self._last_part2dev]
             self.dev_id_bytes = new_dev_id_bytes
 
         # Add holes to self.devs to ensure self.devs[dev['id']] will be the dev
@@ -657,6 +670,11 @@ class RingBuilder(object):
         # Since we're going to loop over every replica of every part we'll
         # also count up changed_parts if old_replica2part2dev is passed in
         old_replica2part2dev = old_replica2part2dev or []
+        if old_replica2part2dev:
+            # we're going to store the last parts so clear the last_part2dev
+            self._last_part2dev = [array(
+                self.dev_id_type_code,
+                itertools.repeat(self.none_dev_id, self.parts))]
         # Compare the partition allocation before and after the rebalance
         # Only changed device ids are taken into account; devices might be
         # "touched" during the rebalance, but actually not really moved
@@ -687,6 +705,8 @@ class RingBuilder(object):
 
                 if old_device != dev['id']:
                     changed_parts += 1
+                    if old_replica2part2dev:
+                        self._last_part2dev[0][part_id] = old_device
             # update running totals for each tiers' number of parts with a
             # given replica count
             part_risk_depth = defaultdict(int)
@@ -1046,6 +1066,10 @@ class RingBuilder(object):
             self._replica2part2dev = [
                 resized_array(p2d, new_dev_id_bytes)
                 for p2d in self._replica2part2dev]
+            if self._last_part2dev:
+                self._last_part2dev = [
+                    resize_array(p2d, new_dev_id_bytes)
+                    for p2d in self._last_part2dev]
             self.dev_id_bytes = new_dev_id_bytes
 
         return removed_devs

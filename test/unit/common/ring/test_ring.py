@@ -67,6 +67,8 @@ class TestRingData(unittest.TestCase):
         self.assertEqual(rd_expected._part_shift, rd_got._part_shift)
         self.assertEqual(rd_expected.next_part_power, rd_got.next_part_power)
         self.assertEqual(rd_expected.version, rd_got.version)
+        self.assertEqual(rd_expected._last_part2dev_id,
+                         rd_got._last_part2dev_id)
 
     def test_attrs(self):
         r2p2d = [[0, 1, 0, 1], [0, 1, 0, 1]]
@@ -235,6 +237,9 @@ class TestRing(TestRingBase):
             array.array('H', [0, 1, 0, 1]),
             array.array('H', [0, 1, 0, 1]),
             array.array('H', [3, 4, 3, 4])]
+        none_dev = ring_utils.none_dev_id(2)
+        self.intended_last_part2dev_id = [array.array(
+            'H', [none_dev, none_dev, 3, 4])]
         self.intended_devs = [{'id': 0, 'region': 0, 'zone': 0, 'weight': 1.0,
                                'ip': '10.1.1.1', 'port': 6200,
                                'replication_ip': '10.1.0.1',
@@ -256,7 +261,8 @@ class TestRing(TestRingBase):
         self.intended_reload_time = 15
         rd = ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift)
+            self.intended_devs, self.intended_part_shift,
+            last_part2dev_id=self.intended_last_part2dev_id)
         rd.save(self.testgz, format_version=self.FORMAT_VERSION)
         self.ring = ring.Ring(
             self.testdir,
@@ -474,6 +480,11 @@ class TestRing(TestRingBase):
         part, nodes = self.ring.get_nodes('a')
         self.assertEqual(nodes, self.ring.get_part_nodes(part))
 
+    def test_get_last_part_nodes(self):
+        # Ring v1 can't safely serialize last-primaries
+        self.assertEqual([None] * 6, [
+            self.ring.get_last_part_node(part) for part in range(6)])
+
     def test_get_nodes(self):
         # Yes, these tests are deliberately very fragile. We want to make sure
         # that if someones changes the results the ring produces, they know it.
@@ -657,6 +668,31 @@ class TestRing(TestRingBase):
         num_parts_changed, _balance, _removed_dev = rb.rebalance(seed=2)
         rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
+
+        # part 19 changed in that rebalance, but only v2 knows about the old
+        # assignment.
+        last_dev = r.get_last_part_node(19)
+        if self.FORMAT_VERSION == 1:
+            self.assertIsNone(last_dev)
+            last_dev = r.devs[21]  # other assertions want to know
+        else:
+            self.assertEqual(last_dev, r.devs[21])
+
+        # run_get_more_nodes on part 19 with for_read will put the old primary
+        # device on the front of the list (unless on v1)
+        more_nodes = list(d['id'] for d in r.get_more_nodes(19))
+        self.assertNotEqual(last_dev['id'], more_nodes[0])
+        read_nodes = list(d['id'] for d in r.get_more_nodes(19, for_read=True))
+        if self.FORMAT_VERSION == 1:
+            self.assertEqual(more_nodes, read_nodes)
+        else:
+            self.assertEqual(last_dev['id'], read_nodes[0])
+
+        # if there isn't a old primary it wont get added
+        more_nodes = list(d['id'] for d in r.get_more_nodes(18))
+        more_nodes_for_read = list(
+            d['id'] for d in r.get_more_nodes(18, for_read=True))
+        self.assertEqual(more_nodes, more_nodes_for_read)
 
         # so now we expect the device list to be longer by one device
         part_handoff_counts = set()
@@ -1044,11 +1080,14 @@ class TestRingV2(TestRing):
             }).encode('ascii')
             fp.write(b'R1NG\x00\x02' + struct.pack('!Q', len(meta)) + meta)
             fp.write(struct.pack('!Q', 12) + b'\x00\x01\x03' * 4)
+            fp.write(struct.pack('!Q', 0))
             fp.write(b'some extra junk data')
         r = ring.Ring(ring_file)
         self.assertEqual(
             [[d['id'] for d in r.get_part_nodes(p)] for p in range(8)],
             [[0, 3], [1, 0], [3, 1], [0, 3], [1], [3], [0], [1]])
+        self.assertEqual([r.get_last_part_node(p) for p in range(8)],
+                         [None] * 8)
 
     def test_4_byte_dev_ids(self):
         ring_file = os.path.join(self.testdir, 'test.ring.gz')
@@ -1071,11 +1110,24 @@ class TestRingV2(TestRing):
                 b'\x00\x00\x00\x03'
                 b'\x00\x00\x00\x02'
                 b'\x00\x00\x00\x00'))
+            fp.write(struct.pack('!Q', 32) + b'\x00' * 32)
             fp.write(b'some extra junk data')
         r = ring.Ring(ring_file)
         self.assertEqual(
             [[d['id'] for d in r.get_part_nodes(p)] for p in range(8)],
             [[3, 0], [2, 3], [0, 2], [3, 0], [2], [0], [3], [2]])
+        self.assertEqual([r.get_last_part_node(p)['id'] for p in range(8)],
+                         [0] * 8)
+
+    def test_get_last_part_nodes(self):
+        # Notice that the API allows us to go beyond our max partition (3)
+        # but it'll just return None.
+        self.assertEqual([
+            None, None, self.intended_devs[3],
+            self.intended_devs[4], None, None,
+        ], [
+            self.ring.get_last_part_node(part) for part in range(6)
+        ])
 
 
 if __name__ == '__main__':

@@ -35,7 +35,7 @@ from six.moves import range
 from swift.common.exceptions import RingLoadError, DevIdBytesTooSmall
 from swift.common.utils import hash_path, validate_configuration, md5
 from swift.common.ring.utils import tiers_for_dev, BYTES_TO_TYPE_CODE, \
-    calculate_minimum_dev_id_bytes, resized_array
+    calculate_minimum_dev_id_bytes, resized_array, none_dev_id
 
 
 DEFAULT_RING_FORMAT_VERSION = 1
@@ -180,12 +180,13 @@ class RingData(object):
     """Partitioned consistent hashing ring data (used for serialization)."""
 
     def __init__(self, replica2part2dev_id, devs, part_shift,
-                 next_part_power=None, version=None):
+                 next_part_power=None, version=None, last_part2dev_id=None):
         self.devs = devs
         self._replica2part2dev_id = replica2part2dev_id
         self._part_shift = part_shift
         self.next_part_power = next_part_power
         self.version = version
+        self._last_part2dev_id = last_part2dev_id or []
         self.md5 = self.size = self.raw_size = None
 
         for dev in self.devs:
@@ -196,6 +197,10 @@ class RingData(object):
     def replica_count(self):
         """Number of replicas (full or partial) used in the ring."""
         return calc_replica_count(self._replica2part2dev_id)
+
+    @property
+    def none_dev_id(self):
+        return none_dev_id(self.dev_id_bytes)
 
     def set_dev_id_bytes(self, dev_id_bytes):
         if dev_id_bytes not in BYTES_TO_TYPE_CODE:
@@ -212,6 +217,10 @@ class RingData(object):
         self._replica2part2dev_id = [
             resized_array(part2dev_id, dev_id_bytes)
             for part2dev_id in self._replica2part2dev_id]
+
+        self._last_part2dev_id = [
+            resize_array(part2dev_id, dev_id_bytes)
+            for part2dev_id in self._last_part2dev_id]
 
     def calculate_and_update_dev_id_bytes(self):
         new_dev_id_bytes = calculate_minimum_dev_id_bytes(len(self.devs) - 1)
@@ -238,6 +247,7 @@ class RingData(object):
         json_len, = struct.unpack('!I', gz_file.read(4))
         ring_dict = json.loads(gz_file.read(json_len))
         ring_dict['replica2part2dev_id'] = []
+        ring_dict['last_primary2dev_id'] = []
 
         if metadata_only:
             return ring_dict
@@ -274,6 +284,7 @@ class RingData(object):
         with FixedLengthReader(gz_file, json_len) as data:
             ring_dict = json.load(data)
         ring_dict['replica2part2dev_id'] = []
+        ring_dict['last_primary2dev_id'] = []
 
         partition_count = 1 << (32 - ring_dict['part_shift'])
         max_row_len = ring_dict['dev_id_bytes'] * partition_count
@@ -290,6 +301,16 @@ class RingData(object):
         # This is the end of the required fields; anything after this point
         # needs to check that they actually read a length before trying to
         # unpack it
+
+        # Attempt to load the last primary table
+        packed_len = gz_file.read(8)
+        if not packed_len:
+            return ring_dict
+        data_len, = struct.unpack('!Q', packed_len)
+        with FixedLengthReader(gz_file, data_len) as data:
+            for row in iter(lambda: data.read(max_row_len), b''):
+                ring_dict['last_primary2dev_id'].append(
+                    read_network_order_array(type_code, row))
 
         return ring_dict
 
@@ -325,7 +346,8 @@ class RingData(object):
             ring_data = RingData(ring_data['replica2part2dev_id'],
                                  ring_data['devs'], ring_data['part_shift'],
                                  ring_data.get('next_part_power'),
-                                 ring_data.get('version'))
+                                 ring_data.get('version'),
+                                 ring_data.get('last_primary2dev_id'))
         for attr in ('md5', 'size', 'raw_size'):
             setattr(ring_data, attr, getattr(gz_file, attr))
         return ring_data
@@ -354,7 +376,8 @@ class RingData(object):
         json_len = len(json_text)
         file_obj.write(struct.pack('!I', json_len))
         file_obj.write(json_text)
-        for part2dev_id in ring['replica2part2dev_id']:
+        part2devs = list(ring['replica2part2dev_id'])
+        for part2dev_id in part2devs:
             if six.PY2:
                 # Can't just use tofile() because a GzipFile apparently
                 # doesn't count as an 'open file'
@@ -403,6 +426,18 @@ class RingData(object):
         # format, and always optional (since old code won't attempt to parse
         # it). If we want to add a new *required* field, we need a v3 format.
 
+        assignments = sum(len(a) for a in ring['last_part2dev_id'])
+        file_obj.write(struct.pack('!Q', assignments * ring['dev_id_bytes']))
+
+        for part2dev_id in ring['last_part2dev_id']:
+            with network_order_array(part2dev_id):
+                if six.PY2:
+                    # Can't just use tofile() because a GzipFile apparently
+                    # doesn't count as an 'open file'
+                    file_obj.write(part2dev_id.tostring())
+                else:
+                    part2dev_id.tofile(file_obj)
+
     def save(self, filename, mtime=1300507380.0,
              format_version=DEFAULT_RING_FORMAT_VERSION):
         """
@@ -439,6 +474,7 @@ class RingData(object):
     def to_dict(self):
         return {'devs': self.devs,
                 'replica2part2dev_id': self._replica2part2dev_id,
+                'last_part2dev_id': self._last_part2dev_id,
                 'part_shift': self._part_shift,
                 'next_part_power': self.next_part_power,
                 'version': self.version}
@@ -503,6 +539,7 @@ class Ring(object):
 
             self._replica2part2dev_id = ring_data._replica2part2dev_id
             self._part_shift = ring_data._part_shift
+            self._last_part2dev_id = ring_data._last_part2dev_id
             self._rebuild_tier_data()
             self._update_bookkeeping()
             self._next_part_power = ring_data.next_part_power
@@ -510,6 +547,7 @@ class Ring(object):
             self._md5 = ring_data.md5
             self._size = ring_data.size
             self._raw_size = ring_data.raw_size
+            self.none_dev_id = ring_data.none_dev_id
 
     def _update_bookkeeping(self):
         # Do this now, when we know the data has changed, rather than
@@ -628,6 +666,25 @@ class Ring(object):
         """
         return getmtime(self.serialized_path) != self._mtime
 
+    def get_last_part_node(self, part):
+        """
+        Return the node that was a primary for the given part before
+        the last rebalance, if there was a previous owner.
+
+        This can only return nodes that were primaries in last partition.
+        """
+        if not (self._last_part2dev_id and self._last_part2dev_id[0] and
+                part < len(self._last_part2dev_id[0])):
+            return None
+
+        dev_id = self._last_part2dev_id[0][part]
+        if dev_id != self.none_dev_id:
+            try:
+                return self.devs[dev_id]
+            except IndexError:
+                pass
+        return None
+
     def _get_part_nodes(self, part):
         part_nodes = []
         seen_ids = set()
@@ -702,7 +759,7 @@ class Ring(object):
         part = self.get_part(account, container, obj)
         return part, self._get_part_nodes(part)
 
-    def get_more_nodes(self, part):
+    def get_more_nodes(self, part, for_read=False):
         """
         Generator to get extra nodes for a partition for hinted handoff.
 
@@ -712,6 +769,8 @@ class Ring(object):
         ring changes.
 
         :param part: partition to get handoff nodes for
+        :param for_read: if true insert the last primary at the start of
+            the generator, if one exists for the part.
         :returns: generator of node dicts
 
         See :func:`get_nodes` for a description of the node dicts.
@@ -725,6 +784,14 @@ class Ring(object):
         same_zones = set((d['region'], d['zone']) for d in primary_nodes)
         same_ips = set(
             (d['region'], d['zone'], d['ip']) for d in primary_nodes)
+
+        # if for_read is used attempt to first push the last primary, if it
+        # hesn't already be used.
+        if for_read:
+            last_primary = self.get_last_part_node(part)
+            if last_primary and last_primary['id'] not in used:
+                yield dict(last_primary, handoff_index=next(index))
+                used.add(last_primary['id'])
 
         parts = len(self._replica2part2dev_id[0])
         part_hash = md5(str(part).encode('ascii'),
