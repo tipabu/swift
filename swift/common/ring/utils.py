@@ -22,6 +22,15 @@ from swift.common.utils import expand_ipv6, is_valid_ip, is_valid_ipv4, \
     is_valid_ipv6
 
 
+BYTES_TO_TYPE_CODE = {
+    1: 'B',
+    2: 'H',
+    4: 'I',
+    # This just seems excessive; besides, array.array() only takes it on py33+
+    # 8: 'Q',
+}
+
+
 def tiers_for_dev(dev):
     """
     Returns a tuple of tiers for a given device in ascending order by

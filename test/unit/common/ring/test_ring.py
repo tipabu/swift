@@ -15,8 +15,10 @@
 
 import array
 import collections
+import json
 import six.moves.cPickle as pickle
 import os
+import struct
 import unittest
 import stat
 from contextlib import closing
@@ -114,30 +116,36 @@ class TestRingData(unittest.TestCase):
         self.assert_ring_data_equal(rd, rd2)
 
     def test_load_closes_file(self):
-        ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
-        rd = ring.RingData(
-            [array.array('H', [0, 1, 0, 1]), array.array('H', [0, 1, 0, 1])],
-            [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}], 30)
-        rd.save(ring_fname)
+        def test_format_version(vrs):
+            ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
+            rd = ring.RingData(
+                [array.array('H', [0, 1, 0, 1]),
+                 array.array('H', [0, 1, 0, 1])],
+                [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}], 30)
+            rd.save(ring_fname, format_version=vrs)
 
-        class MockReader(ring.ring.RingReader):
-            calls = []
+            class MockReader(ring.ring.RingReader):
+                calls = []
 
-            def close(self):
-                self.calls.append(('close', self.fp))
-                return super(MockReader, self).close()
+                def close(self):
+                    self.calls.append(('close', self.fp))
+                    return super(MockReader, self).close()
 
-        with mock.patch('swift.common.ring.ring.RingReader',
-                        MockReader) as mock_reader:
-            ring.RingData.load(ring_fname)
+            with mock.patch('swift.common.ring.ring.RingReader',
+                            MockReader) as mock_reader:
+                ring.RingData.load(ring_fname)
 
-        self.assertEqual([('close', mock.ANY)], mock_reader.calls)
-        self.assertTrue(mock_reader.calls[0][1].closed)
+            self.assertEqual([('close', mock.ANY)], mock_reader.calls)
+            self.assertTrue(mock_reader.calls[0][1].closed)
+
+        test_format_version(1)
+        test_format_version(2)
 
     def test_byteswapped_serialization(self):
         # Manually byte swap a ring and write it out, claiming it was written
         # on a different endian machine. Then read it back in and see if it's
-        # the same as the non-byte swapped original.
+        # the same as the non-byte swapped original. This can only be a
+        # problem for pre-v2 rings
 
         ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
         data = [array.array('H', [0, 1, 0, 1]), array.array('H', [0, 1, 0, 1])]
@@ -151,7 +159,7 @@ class TestRingData(unittest.TestCase):
             rds = ring.RingData(swapped_data,
                                 [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}],
                                 30)
-            rds.save(ring_fname)
+            rds.save(ring_fname, format_version=1)
 
         rd1 = ring.RingData(data, [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}],
                             30)
@@ -159,9 +167,7 @@ class TestRingData(unittest.TestCase):
         self.assert_ring_data_equal(rd1, rd2)
 
     def test_deterministic_serialization(self):
-        """
-        Two identical rings should produce identical .gz files on disk.
-        """
+        # Two identical rings should produce identical .gz files on disk.
         os.mkdir(os.path.join(self.testdir, '1'))
         os.mkdir(os.path.join(self.testdir, '2'))
         # These have to have the same filename (not full path,
@@ -171,8 +177,14 @@ class TestRingData(unittest.TestCase):
         rd = ring.RingData(
             [array.array('H', [0, 1, 0, 1]), array.array('H', [0, 1, 0, 1])],
             [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}], 30)
-        rd.save(ring_fname1)
-        rd.save(ring_fname2)
+        rd.save(ring_fname1, format_version=1)
+        rd.save(ring_fname2, format_version=1)
+        with open(ring_fname1, 'rb') as ring1:
+            with open(ring_fname2, 'rb') as ring2:
+                self.assertEqual(ring1.read(), ring2.read())
+
+        rd.save(ring_fname1, format_version=2)
+        rd.save(ring_fname2, format_version=2)
         with open(ring_fname1, 'rb') as ring1:
             with open(ring_fname2, 'rb') as ring2:
                 self.assertEqual(ring1.read(), ring2.read())
@@ -207,6 +219,7 @@ class TestRingData(unittest.TestCase):
 
 
 class TestRing(TestRingBase):
+    FORMAT_VERSION = 1
 
     def setUp(self):
         super(TestRing, self).setUp()
@@ -235,9 +248,10 @@ class TestRing(TestRingBase):
                                'replication_port': 6066}]
         self.intended_part_shift = 30
         self.intended_reload_time = 15
-        ring.RingData(
+        rd = ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift)
+        rd.save(self.testgz, format_version=self.FORMAT_VERSION)
         self.ring = ring.Ring(
             self.testdir,
             reload_time=self.intended_reload_time, ring_name='whatever')
@@ -291,7 +305,8 @@ class TestRing(TestRingBase):
              'ip': '10.1.1.1', 'port': 9876})
         ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift,
+        ).save(self.testgz, format_version=self.FORMAT_VERSION)
         sleep(0.1)
         self.ring.get_nodes('a')
         self.assertEqual(len(self.ring.devs), 6)
@@ -307,7 +322,8 @@ class TestRing(TestRingBase):
              'ip': '10.5.5.5', 'port': 9876})
         ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift
+        ).save(self.testgz, format_version=self.FORMAT_VERSION)
         sleep(0.1)
         self.ring.get_part_nodes(0)
         self.assertEqual(len(self.ring.devs), 7)
@@ -324,7 +340,8 @@ class TestRing(TestRingBase):
              'ip': '10.6.6.6', 'port': 6200})
         ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift,
+        ).save(self.testgz, format_version=self.FORMAT_VERSION)
         sleep(0.1)
         next(self.ring.get_more_nodes(part))
         self.assertEqual(len(self.ring.devs), 8)
@@ -340,7 +357,8 @@ class TestRing(TestRingBase):
              'ip': '10.5.5.5', 'port': 6200})
         ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift,
+        ).save(self.testgz, format_version=self.FORMAT_VERSION)
         sleep(0.1)
         self.assertEqual(len(self.ring.devs), 9)
         self.assertNotEqual(self.ring._mtime, orig_mtime)
@@ -379,7 +397,8 @@ class TestRing(TestRingBase):
         testgz = os.path.join(self.testdir, 'without_replication.ring.gz')
         ring.RingData(
             self.intended_replica2part2dev_id,
-            replication_less_devs, self.intended_part_shift).save(testgz)
+            replication_less_devs, self.intended_part_shift,
+        ).save(testgz, format_version=self.FORMAT_VERSION)
         self.ring = ring.Ring(
             self.testdir,
             reload_time=self.intended_reload_time,
@@ -583,7 +602,7 @@ class TestRing(TestRingBase):
                                 'device': "d%s" % device})
                     next_dev_id += 1
         rb.rebalance(seed=2)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # every part has the same number of handoffs
@@ -630,7 +649,7 @@ class TestRing(TestRingBase):
         next_dev_id += 1
         rb.pretend_min_part_hours_passed()
         num_parts_changed, _balance, _removed_dev = rb.rebalance(seed=2)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # so now we expect the device list to be longer by one device
@@ -678,7 +697,7 @@ class TestRing(TestRingBase):
         # Remove a device - no need to fluff min_part_hours.
         rb.remove_dev(0)
         num_parts_changed, _balance, _removed_dev = rb.rebalance(seed=1)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # so now we expect the device list to be shorter by one device
@@ -748,7 +767,7 @@ class TestRing(TestRingBase):
         # Add a partial replica
         rb.set_replicas(3.5)
         num_parts_changed, _balance, _removed_dev = rb.rebalance(seed=164)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # Change expectations
@@ -865,7 +884,7 @@ class TestRing(TestRingBase):
         rb.rebalance(seed=1)
         rb.pretend_min_part_hours_passed()
         rb.rebalance(seed=1)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # There's 5 regions now, so the primary nodes + first 2 handoffs
@@ -935,7 +954,7 @@ class TestRing(TestRingBase):
                 dev['weight'] = 1.0
             rb.add_dev(dev)
         rb.rebalance()
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
         self.assertEqual(r.version, rb.version)
 
@@ -996,6 +1015,61 @@ class TestRing(TestRingBase):
         # Hard limit at 50 (we've seen as bad as 41, 45)
         self.assertEqual(sum(histogram.get(x, 0) for x in range(50, 100)), 0,
                          histogram)
+
+
+class TestRingV2(TestRing):
+    FORMAT_VERSION = 2
+
+    def test_1_byte_dev_ids(self):
+        ring_file = os.path.join(self.testdir, 'test.ring.gz')
+        with GzipFile(ring_file, 'wb') as fp:
+            meta = json.dumps({
+                "dev_id_bytes": 1,
+                "devs": [
+                    {"id": 0, "zone": 1, "ip": "127.0.0.1", "port": 6200,
+                     "device": "sda", "weight": 1},
+                    {"id": 1, "zone": 1, "ip": "127.0.0.1", "port": 6201,
+                     "device": "sdb", "weight": 1},
+                    None,
+                    {"id": 3, "zone": 1, "ip": "127.0.0.1", "port": 6202,
+                     "device": "sdc", "weight": 1},
+                ],
+                "part_shift": 29,
+            }).encode('ascii')
+            fp.write(b'R1NG\x00\x02' + struct.pack('!Q', len(meta)) + meta)
+            fp.write(struct.pack('!Q', 12) + b'\x00\x01\x03' * 4)
+            fp.write(b'some extra junk data')
+        r = ring.Ring(ring_file)
+        self.assertEqual(
+            [[d['id'] for d in r.get_part_nodes(p)] for p in range(8)],
+            [[0, 3], [1, 0], [3, 1], [0, 3], [1], [3], [0], [1]])
+
+    def test_4_byte_dev_ids(self):
+        ring_file = os.path.join(self.testdir, 'test.ring.gz')
+        with GzipFile(ring_file, 'wb') as fp:
+            meta = json.dumps({
+                "dev_id_bytes": 4,
+                "devs": [
+                    {"id": 0, "zone": 1, "ip": "127.0.0.1", "port": 6200,
+                     "device": "sda", "weight": 1},
+                    None,
+                    {"id": 2, "zone": 1, "ip": "127.0.0.1", "port": 6201,
+                     "device": "sdb", "weight": 1},
+                    {"id": 3, "zone": 1, "ip": "127.0.0.1", "port": 6202,
+                     "device": "sdc", "weight": 1},
+                ],
+                "part_shift": 29,
+            }).encode('ascii')
+            fp.write(b'R1NG\x00\x02' + struct.pack('!Q', len(meta)) + meta)
+            fp.write(struct.pack('!Q', 48) + 4 * (
+                b'\x00\x00\x00\x03'
+                b'\x00\x00\x00\x02'
+                b'\x00\x00\x00\x00'))
+            fp.write(b'some extra junk data')
+        r = ring.Ring(ring_file)
+        self.assertEqual(
+            [[d['id'] for d in r.get_part_nodes(p)] for p in range(8)],
+            [[3, 0], [2, 3], [0, 2], [3, 0], [2], [0], [3], [2]])
 
 
 if __name__ == '__main__':

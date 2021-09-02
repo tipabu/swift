@@ -2546,12 +2546,22 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         argv = ["", self.tmpfile, "write_ring"]
         self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
 
+        out, err = self.run_srb("write_ring")
+        self.assertIn("Defaulting to --format-version=1", out)
+
+        out, err = self.run_srb("write_ring --format-version 1")
+        self.assertNotIn("Defaulting to --format-version=1", out)
+
+        out, err = self.run_srb("write_ring --format-version 2")
+        self.assertNotIn("Defaulting to --format-version=1", out)
+
     def test_write_empty_ring(self):
         ring = RingBuilder(6, 3, 1)
         ring.save(self.tmpfile)
         exp_results = {'valid_exit_codes': [2]}
         out, err = self.run_srb("write_ring", exp_results=exp_results)
-        self.assertEqual('Unable to write empty ring.\n', out)
+        exp_out = 'Unable to write empty ring.\n'
+        self.assertEqual(exp_out, out[-len(exp_out):])
 
     def test_write_builder(self):
         # Test builder file already exists
@@ -2876,6 +2886,7 @@ class TestRebalanceCommand(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.run_srb("pretend_min_part_hours_passed")
         out, err = self.run_srb("rebalance")
         self.assertNotIn("rebalance/repush", out)
+        self.assertIn("Defaulting to --format-version=1", out)
 
     def test_rebalance_warning_with_overload(self):
         self.run_srb("create", 8, 3, 24)

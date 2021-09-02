@@ -201,12 +201,17 @@ def _make_composite_ring(builders):
     composite_r2p2d = []
     composite_devs = []
     device_offset = 0
+    required_itemsize = builders[0]._replica2part2dev[0].itemsize
     for builder in builders:
         # copy all devs list and replica2part2dev table to be able
         # to modify the id for each dev
         devs = copy.deepcopy(builder.devs)
         r2p2d = copy.deepcopy(builder._replica2part2dev)
         for part2dev in r2p2d:
+            if part2dev.itemsize != required_itemsize:
+                raise ValueError(
+                    'Cannot make composite rings with mixed item sizes '
+                    '(%d vs %d)' % (part2dev.itemsize, required_itemsize))
             for part, dev in enumerate(part2dev):
                 part2dev[part] += device_offset
         for dev in [d for d in devs if d]:

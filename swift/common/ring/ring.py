@@ -34,9 +34,11 @@ from six.moves import range
 
 from swift.common.exceptions import RingLoadError
 from swift.common.utils import hash_path, validate_configuration, md5
-from swift.common.ring.utils import tiers_for_dev
+from swift.common.ring.utils import tiers_for_dev, BYTES_TO_TYPE_CODE
 
 
+DEFAULT_RING_FORMAT_VERSION = 1
+ALLOWED_RING_FORMAT_VERSIONS = (1, 2)
 DEFAULT_RELOAD_TIME = 15
 
 
@@ -46,6 +48,60 @@ def calc_replica_count(replica2part2dev_id):
     base = len(replica2part2dev_id) - 1
     extra = 1.0 * len(replica2part2dev_id[-1]) / len(replica2part2dev_id[0])
     return base + extra
+
+
+@contextlib.contextmanager
+def network_order_array(arr):
+    if sys.byteorder == 'little':
+        # Switch to network-order for serialization
+        arr.byteswap()
+    try:
+        yield arr
+    finally:
+        if sys.byteorder == 'little':
+            # Didn't make a copy; switch it back
+            arr.byteswap()
+
+
+def read_network_order_array(type_code, data):
+    arr = array.array(type_code, data)
+    if sys.byteorder == 'little':
+        arr.byteswap()
+    return arr
+
+
+class FixedLengthReader(object):
+    '''
+    Wrap a file-like to cap how much can be read.
+
+    This is useful for v2 ring formats which use a length-value encoding.
+    On close, it verifies that the full length was read.
+
+    :param fp: the file-like to wrap
+    :param length: the maximum number of bytes to read
+    '''
+    def __init__(self, fp, length):
+        self._fp = fp
+        self._remaining = length
+
+    def read(self, amt=None):
+        if amt is None or amt < 0:
+            amt = self._remaining
+        amt = min(amt, self._remaining)
+        data = self._fp.read(amt)
+        self._remaining -= len(data)
+        return data
+
+    def close(self):
+        if self._remaining:
+            raise ValueError('Excess data in block: %d bytes remaining'
+                             % self._remaining)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 class RingReader(object):
@@ -65,6 +121,12 @@ class RingReader(object):
     @property
     def close(self):
         return self.fp.close
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     def seek(self, pos, ref=0):
         if (pos, ref) != (0, 0):
@@ -170,6 +232,46 @@ class RingData(object):
         return ring_dict
 
     @classmethod
+    def deserialize_v2(cls, gz_file, metadata_only=False):
+        """
+        Deserialize a v2 ring file into a dictionary with `devs`, `part_shift`,
+        and `replica2part2dev_id` keys.
+
+        If the optional kwarg `metadata_only` is True, then the
+        `replica2part2dev_id` is not loaded and that key in the returned
+        dictionary just has the value `[]`.
+
+        :param file gz_file: An opened file-like object which has already
+                             consumed the 6 bytes of magic and version.
+        :param bool metadata_only: If True, only load `devs` and `part_shift`
+        :returns: A dict containing `devs`, `part_shift`, and
+                  `replica2part2dev_id`
+        """
+
+        json_len, = struct.unpack('!Q', gz_file.read(8))
+        with FixedLengthReader(gz_file, json_len) as data:
+            ring_dict = json.load(data)
+        ring_dict['replica2part2dev_id'] = []
+
+        partition_count = 1 << (32 - ring_dict['part_shift'])
+        max_row_len = ring_dict['dev_id_bytes'] * partition_count
+        type_code = BYTES_TO_TYPE_CODE[ring_dict['dev_id_bytes']]
+        if metadata_only:
+            return ring_dict
+
+        data_len, = struct.unpack('!Q', gz_file.read(8))
+        with FixedLengthReader(gz_file, data_len) as data:
+            for row in iter(lambda: data.read(max_row_len), b''):
+                ring_dict['replica2part2dev_id'].append(
+                    read_network_order_array(type_code, row))
+
+        # This is the end of the required fields; anything after this point
+        # needs to check that they actually read a length before trying to
+        # unpack it
+
+        return ring_dict
+
+    @classmethod
     def load(cls, filename, metadata_only=False):
         """
         Load ring data from a file.
@@ -178,13 +280,16 @@ class RingData(object):
         :param bool metadata_only: If True, only load `devs` and `part_shift`.
         :returns: A RingData instance containing the loaded data.
         """
-        with contextlib.closing(RingReader(filename)) as gz_file:
+        with RingReader(filename) as gz_file:
             # See if the file is in the new format
             magic = gz_file.read(4)
             if magic == b'R1NG':
                 format_version, = struct.unpack('!H', gz_file.read(2))
                 if format_version == 1:
                     ring_data = cls.deserialize_v1(
+                        gz_file, metadata_only=metadata_only)
+                elif format_version == 2:
+                    ring_data = cls.deserialize_v2(
                         gz_file, metadata_only=metadata_only)
                 else:
                     raise Exception('Unknown ring format version %d' %
@@ -234,20 +339,72 @@ class RingData(object):
             else:
                 part2dev_id.tofile(file_obj)
 
-    def save(self, filename, mtime=1300507380.0):
+    def serialize_v2(self, file_obj):
+        # Write out new-style serialization magic and version:
+        file_obj.write(struct.pack('!4sH', b'R1NG', 2))
+        ring = self.to_dict()
+
+        # Only include next_part_power if it is set in the
+        # builder, otherwise just ignore it
+        _text = {'devs': ring['devs'], 'part_shift': ring['part_shift'],
+                 'dev_id_bytes': 2}
+
+        if ring['version'] is not None:
+            _text['version'] = ring['version']
+
+        next_part_power = ring.get('next_part_power')
+        if next_part_power is not None:
+            _text['next_part_power'] = next_part_power
+
+        json_text = json.dumps(_text, sort_keys=True,
+                               ensure_ascii=True).encode('ascii')
+        json_len = len(json_text)
+        file_obj.write(struct.pack('!Q', json_len))
+        file_obj.write(json_text)
+
+        assignments = sum(len(a) for a in ring['replica2part2dev_id'])
+        file_obj.write(struct.pack('!Q', 2 * assignments))
+
+        for part2dev_id in ring['replica2part2dev_id']:
+            with network_order_array(part2dev_id):
+                if six.PY2:
+                    # Can't just use tofile() because a GzipFile apparently
+                    # doesn't count as an 'open file'
+                    file_obj.write(part2dev_id.tostring())
+                else:
+                    part2dev_id.tofile(file_obj)
+
+        # Future code may put more data past the end. It should always be in
+        #   [ length (8 bytes) ][ blob (<length> bytes) ]
+        # format, and always optional (since old code won't attempt to parse
+        # it). If we want to add a new *required* field, we need a v3 format.
+
+    def save(self, filename, mtime=1300507380.0,
+             format_version=DEFAULT_RING_FORMAT_VERSION):
         """
         Serialize this RingData instance to disk.
 
         :param filename: File into which this instance should be serialized.
         :param mtime: time used to override mtime for gzip, default or None
                       if the caller wants to include time
+        :param format_version: Ring format version to use. May be 1 (default)
+                               or 2. Older versions of Swift will refuse to
+                               load rings with unrecognized versions.
         """
+        if format_version == 1:
+            serialize_f = self.serialize_v1
+        elif format_version == 2:
+            serialize_f = self.serialize_v2
+        else:
+            raise ValueError('format_version must be one of %r'
+                             % (ALLOWED_RING_FORMAT_VERSIONS,))
         # Override the timestamp so that the same ring data creates
         # the same bytes on disk. This makes a checksum comparison a
         # good way to see if two rings are identical.
         tempf = NamedTemporaryFile(dir=".", prefix=filename, delete=False)
         gz_file = GzipFile(filename, mode='wb', fileobj=tempf, mtime=mtime)
-        self.serialize_v1(gz_file)
+        serialize_f(gz_file)
+        # else, should have raised ValueError at the top
         gz_file.close()
         tempf.flush()
         os.fsync(tempf.fileno())

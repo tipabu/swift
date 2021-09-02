@@ -34,6 +34,8 @@ from six.moves import input
 
 from swift.common import exceptions
 from swift.common.ring import RingBuilder, Ring, RingData
+from swift.common.ring.ring import ALLOWED_RING_FORMAT_VERSIONS, \
+    DEFAULT_RING_FORMAT_VERSION
 from swift.common.ring.builder import MAX_BALANCE
 from swift.common.ring.composite_builder import CompositeRingBuilder
 from swift.common.ring.utils import validate_args, \
@@ -48,6 +50,8 @@ MINOR_VERSION = 3
 EXIT_SUCCESS = 0
 EXIT_WARNING = 1
 EXIT_ERROR = 2
+
+FORMAT_CHOICES = [str(v) for v in ALLOWED_RING_FORMAT_VERSIONS]
 
 global argv, backup_dir, builder, builder_file, ring_file
 argv = backup_dir = builder = builder_file = ring_file = None
@@ -520,6 +524,23 @@ def _make_display_device_table(builder):
         print(format_string % args)
 
     return header_line, print_dev_f
+
+
+class RingBuilderOptionParser(optparse.OptionParser, object):
+
+    def parse_args(self, *args, **kwargs):
+        options, args = super(RingBuilderOptionParser, self).parse_args(
+            *args, **kwargs)
+        if options.format_version is None:
+            print("Defaulting to --format-version=1. This ensures the ring\n"
+                  "written will be readable by older versions of Swift.\n"
+                  "In a future relaese, the default will change to\n"
+                  "--format-version=2\n")
+            options.format_version = DEFAULT_RING_FORMAT_VERSION
+        else:
+            # N.B. choices doesn't work with type=int
+            options.format_version = int(options.format_version)
+        return options, args
 
 
 class Commands(object):
@@ -1034,13 +1055,16 @@ swift-ring-builder <builder_file> rebalance [options]
     recently reassigned.
         """
         usage = Commands.rebalance.__doc__.strip()
-        parser = optparse.OptionParser(usage)
+        parser = RingBuilderOptionParser(usage)
         parser.add_option('-f', '--force', action='store_true',
                           help='Force a rebalanced ring to save even '
                           'if < 1% of parts changed')
         parser.add_option('-s', '--seed', help="seed to use for rebalance")
         parser.add_option('-d', '--debug', action='store_true',
                           help="print debug information")
+        parser.add_option('--format-version',
+                          choices=FORMAT_CHOICES, default=None,
+                          help="specify ring format version")
         options, args = parser.parse_args(argv)
 
         def get_seed(index):
@@ -1156,9 +1180,11 @@ swift-ring-builder <builder_file> rebalance [options]
             status = EXIT_WARNING
         ts = time()
         builder.get_ring().save(
-            pathjoin(backup_dir, '%d.' % ts + basename(ring_file)))
+            pathjoin(backup_dir, '%d.' % ts + basename(ring_file)),
+            format_version=options.format_version)
         builder.save(pathjoin(backup_dir, '%d.' % ts + basename(builder_file)))
-        builder.get_ring().save(ring_file)
+        builder.get_ring().save(
+            ring_file, format_version=options.format_version)
         builder.save(builder_file)
         exit(status)
 
@@ -1283,6 +1309,13 @@ swift-ring-builder <builder_file> write_ring
     'set_info' calls when no rebalance is needed but you want to send out the
     new device information.
         """
+        usage = Commands.write_ring.__doc__.strip()
+        parser = RingBuilderOptionParser(usage)
+        parser.add_option('--format-version',
+                          choices=FORMAT_CHOICES, default=None,
+                          help="specify ring format version")
+        options, args = parser.parse_args(argv)
+
         if not builder.devs:
             print('Unable to write empty ring.')
             exit(EXIT_ERROR)
@@ -1294,8 +1327,9 @@ swift-ring-builder <builder_file> write_ring
                       'assignments but with devices; did you forget to run '
                       '"rebalance"?')
         ring_data.save(
-            pathjoin(backup_dir, '%d.' % time() + basename(ring_file)))
-        ring_data.save(ring_file)
+            pathjoin(backup_dir, '%d.' % time() + basename(ring_file)),
+            format_version=options.format_version)
+        ring_data.save(ring_file, format_version=options.format_version)
         exit(EXIT_SUCCESS)
 
     @staticmethod
