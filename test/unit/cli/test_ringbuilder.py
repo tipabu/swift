@@ -380,6 +380,30 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.assertEqual(dev['replication_port'], 6200)
         self.assertEqual(dev['meta'], 'some meta data')
 
+    def test_add_device_with_id_old_format(self):
+        self.create_sample_ring()
+        # Test ipv4(old format)
+        argv = ["", self.tmpfile, "add",
+                "d65000r2z3-127.0.0.1:6200/sda3_some meta data",
+                "3.14159265359"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        # Check that device was created with given data
+        ring = RingBuilder.load(self.tmpfile)
+        dev = ring.devs[-1]
+        self.assertEqual(dev['region'], 2)
+        self.assertEqual(dev['zone'], 3)
+        self.assertEqual(dev['ip'], '127.0.0.1')
+        self.assertEqual(dev['port'], 6200)
+        self.assertEqual(dev['device'], 'sda3')
+        self.assertEqual(dev['weight'], 3.14159265359)
+        self.assertEqual(dev['replication_ip'], '127.0.0.1')
+        self.assertEqual(dev['replication_port'], 6200)
+        self.assertEqual(dev['meta'], 'some meta data')
+        self.assertEqual(dev['id'], 65000)
+        self.assertEqual(len(ring.devs), 65001)
+        self.assertEqual(ring.devs[4:-1], [None] * 64996)
+
     def test_add_duplicate_devices(self):
         self.create_sample_ring()
         # Test adding duplicate devices
@@ -513,6 +537,12 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         # Test Add a device that already exists
         argv = ["", self.tmpfile, "add",
                 "r0z0-127.0.0.1:6200/sda1_some meta data", "100"]
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+
+    def test_add_device_with_id_already_exists(self):
+        # Test Add a device that already exists
+        argv = ["", self.tmpfile, "add",
+                "d0r0z0-127.0.0.1:6200/sdz1_some meta data", "100"]
         self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 
     def test_add_device_old_missing_region(self):

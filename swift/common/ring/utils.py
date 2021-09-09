@@ -459,31 +459,39 @@ def parse_change_values_from_opts(opts):
 
 def parse_add_value(add_value):
     """
-    Convert an add value, like 'r1z2-10.1.2.3:7878/sdf', to a dictionary.
+    Convert an add value, like 'd123r1z2-10.1.2.3:7878/sdf', to a dictionary.
 
-    If the string does not start with 'r<N>', then the value of 'region' in
+    If the string does not start with 'd<N>', then the value of 'id' in
     the returned dictionary will be None. Callers should check for this and
     set a reasonable default. This is done so callers can emit errors or
     warnings if desired.
 
-    Similarly, 'replication_ip' and 'replication_port' will be None if not
-    specified.
+    Similarly, 'region', 'replication_ip', and 'replication_port', will be
+    None if not specified.
 
     :returns: dictionary with keys 'region', 'zone', 'ip', 'port', 'device',
         'replication_ip', 'replication_port', 'meta'
     :raises ValueError: if add_value is malformed
     """
-    region = None
+    dev_id = None
     rest = add_value
-    if add_value.startswith('r'):
+    if rest.startswith('d'):
         i = 1
-        while i < len(add_value) and add_value[i].isdigit():
+        while i < len(rest) and rest[i].isdigit():
             i += 1
-        region = int(add_value[1:i])
-        rest = add_value[i:]
+        dev_id = int(rest[1:i])
+        rest = rest[i:]
+
+    region = None
+    if rest.startswith('r'):
+        i = 1
+        while i < len(rest) and rest[i].isdigit():
+            i += 1
+        region = int(rest[1:i])
+        rest = rest[i:]
 
     if not rest.startswith('z'):
-        raise ValueError('Invalid add value: %s' % add_value)
+        raise ValueError('Invalid add value, expected zone: %s' % add_value)
     i = 1
     while i < len(rest) and rest[i].isdigit():
         i += 1
@@ -491,7 +499,7 @@ def parse_add_value(add_value):
     rest = rest[i:]
 
     if not rest.startswith('-'):
-        raise ValueError('Invalid add value: %s' % add_value)
+        raise ValueError('Invalid add value, expected dash: %s' % add_value)
 
     ip, port, rest = parse_address(rest[1:])
 
@@ -501,7 +509,7 @@ def parse_add_value(add_value):
             parse_address(rest[1:])
     if not rest.startswith('/'):
         raise ValueError(
-            'Invalid add value: %s' % add_value)
+            'Invalid add value, expected slash: %s' % add_value)
     i = 1
     while i < len(rest) and rest[i] != '_':
         i += 1
@@ -517,7 +525,7 @@ def parse_add_value(add_value):
 
     return {'region': region, 'zone': zone, 'ip': ip, 'port': port,
             'device': device_name, 'replication_ip': replication_ip,
-            'replication_port': replication_port, 'meta': meta}
+            'replication_port': replication_port, 'meta': meta, 'id': dev_id}
 
 
 def parse_address(rest):

@@ -813,9 +813,18 @@ swift-ring-builder <builder_file> add
                                dev['port'], dev['device']))
                         print("The on-disk ring builder is unchanged.\n")
                         exit(EXIT_ERROR)
-                dev_id = builder.add_dev(new_dev)
-                print('Device %s with %s weight got id %s' %
-                      (format_device(new_dev), new_dev['weight'], dev_id))
+                try:
+                    dev_id = builder.add_dev(new_dev)
+                except exceptions.DuplicateDeviceError:
+                    existing_dev = builder.devs[dev['id']]
+                    print('Device %d already exists: %s:%d/%s.' %
+                          (dev['id'], existing_dev['ip'],
+                           existing_dev['port'], existing_dev['device']))
+                    print("The on-disk ring builder is unchanged.\n")
+                    exit(EXIT_ERROR)
+                else:
+                    print('Device %s with %s weight got id %s' %
+                          (format_device(new_dev), new_dev['weight'], dev_id))
         except ValueError as err:
             print(err)
             print('The on-disk ring builder is unchanged.')

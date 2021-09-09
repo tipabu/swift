@@ -66,6 +66,7 @@ class TestParseScenario(unittest.TestCase):
         self.assertEqual(parsed['overload'], 0)
         self.assertEqual(parsed['rounds'], [
             [['add', {'device': 'sda8',
+                      'id': None,
                       'ip': '3.4.5.6',
                       'meta': '',
                       'port': 7,
@@ -75,6 +76,7 @@ class TestParseScenario(unittest.TestCase):
                       'weight': 100.0,
                       'zone': 2}],
              ['add', {'device': u'sda9',
+                      'id': None,
                       'ip': u'3.4.5.6',
                       'meta': '',
                       'port': 7,
@@ -191,7 +193,7 @@ class TestParseScenario(unittest.TestCase):
         # N.B. the ValueError's coming out of ring.utils.parse_add_value
         # are already pretty good
         expected = "Invalid device specifier (round 0, command 0): " \
-            "Invalid add value: not a good value"
+            "Invalid add value, expected zone: not a good value"
         try:
             parse_scenario(json.dumps(busted))
         except ValueError as err:

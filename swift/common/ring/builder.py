@@ -404,7 +404,7 @@ class RingBuilder(object):
         :returns: id of device (not used in the tree anymore, but unknown
                   users may depend on it)
         """
-        if 'id' not in dev:
+        if dev.get('id') is None:
             dev['id'] = 0
             if self.devs:
                 try:
@@ -414,6 +414,8 @@ class RingBuilder(object):
         if dev['id'] < len(self.devs) and self.devs[dev['id']] is not None:
             raise exceptions.DuplicateDeviceError(
                 'Duplicate device id: %d' % dev['id'])
+        if dev['id'] > (2 ** 16) - 2:
+            raise ValueError('Device id %d is too large' % dev['id'])
         # Add holes to self.devs to ensure self.devs[dev['id']] will be the dev
         while dev['id'] >= len(self.devs):
             self.devs.append(None)
