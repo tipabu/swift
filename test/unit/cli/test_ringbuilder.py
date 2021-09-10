@@ -2427,6 +2427,23 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
     def test_rebalance_remove_zero_weighted_device(self):
         self.create_sample_ring()
         ring = RingBuilder.load(self.tmpfile)
+        ring.set_dev_weight(2, 0.0)
+        ring.rebalance()
+        ring.pretend_min_part_hours_passed()
+        ring.remove_dev(2)
+        ring.save(self.tmpfile)
+
+        # Test rebalance after remove 0 weighted device
+        argv = ["", self.tmpfile, "rebalance", "3"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+        self.assertTrue(ring.validate())
+        self.assertEqual(len(ring.devs), 4)
+        self.assertIsNone(ring.devs[2])
+
+    def test_rebalance_remove_off_end_trims_dev_list(self):
+        self.create_sample_ring()
+        ring = RingBuilder.load(self.tmpfile)
         ring.set_dev_weight(3, 0.0)
         ring.rebalance()
         ring.pretend_min_part_hours_passed()
@@ -2438,7 +2455,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
         ring = RingBuilder.load(self.tmpfile)
         self.assertTrue(ring.validate())
-        self.assertIsNone(ring.devs[3])
+        self.assertEqual(len(ring.devs), 3)
 
     def test_rebalance_resets_time_remaining(self):
         self.create_sample_ring()

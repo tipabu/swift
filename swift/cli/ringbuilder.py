@@ -617,6 +617,8 @@ swift-ring-builder <builder_file>
 
         ring_dict = None
         builder_dict = builder.get_ring().to_dict()
+        # mostly just an implementation detail
+        builder_dict.pop('dev_id_bytes', None)
 
         # compare ring file against builder file
         if not exists(ring_file):
@@ -628,6 +630,7 @@ swift-ring-builder <builder_file>
             except Exception as exc:
                 print('Ring file %s is invalid: %r' % (ring_file, exc))
             else:
+                ring_dict.pop('dev_id_bytes', None)  # see above
                 if builder_dict == ring_dict:
                     print('Ring file %s is up-to-date' % ring_file)
                 else:
