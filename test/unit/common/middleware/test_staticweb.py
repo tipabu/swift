@@ -539,6 +539,7 @@ class TestStaticWeb(unittest.TestCase):
         resp = Request.blank('/v1/a/c3/').get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
         self.assertIn(b'Test main index.html file.', resp.body)
+        self.assertNotIn('X-Backend-Content-Generator', resp.headers)
 
     def test_container3subsubdir(self):
         resp = Request.blank(
@@ -591,18 +592,33 @@ class TestStaticWeb(unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         self.assertIn(b'Listing of /v1/a/c4/', resp.body)
         self.assertIn(b'href="listing.css"', resp.body)
+        self.assertIn('X-Backend-Content-Generator', resp.headers)
+        self.assertEqual(resp.headers['X-Backend-Content-Generator'],
+                         'staticweb')
 
     def test_container4indexhtmlauthed(self):
+        # anonymous access gets staticweb
         resp = Request.blank('/v1/a/c4').get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 301)
+
+        # authed access doesn't (by default)
         resp = Request.blank(
             '/v1/a/c4',
             environ={'REMOTE_USER': 'authed'}).get_response(
                 self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
+
+        # it can opt-in, though!
         resp = Request.blank(
             '/v1/a/c4', headers={'x-web-mode': 't'},
             environ={'REMOTE_USER': 'authed'}).get_response(
+                self.test_staticweb)
+        self.assertEqual(resp.status_int, 301)
+
+        # and there's an exclusion for authed-via-tempurl
+        resp = Request.blank(
+            '/v1/a/c4',
+            environ={'REMOTE_USER': '.wsgi.tempurl'}).get_response(
                 self.test_staticweb)
         self.assertEqual(resp.status_int, 301)
 
