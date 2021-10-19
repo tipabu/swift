@@ -101,19 +101,25 @@ class TestRingData(unittest.TestCase):
             self.assert_ring_data_equal(rd, ring_data)
 
     def test_roundtrip_serialization(self):
-        ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
-        rd = ring.RingData(
-            [array.array('H', [0, 1, 0, 1]), array.array('H', [0, 1, 0, 1])],
-            [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}], 30)
-        rd.save(ring_fname)
-        meta_only = ring.RingData.load(ring_fname, metadata_only=True)
-        self.assertEqual([
-            {'id': 0, 'zone': 0, 'region': 1},
-            {'id': 1, 'zone': 1, 'region': 1},
-        ], meta_only.devs)
-        self.assertEqual([], meta_only._replica2part2dev_id)
-        rd2 = ring.RingData.load(ring_fname)
-        self.assert_ring_data_equal(rd, rd2)
+        def test_format(version):
+            ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
+            rd = ring.RingData(
+                [array.array('H', [0, 1, 0, 1]),
+                 array.array('H', [0, 1, 0, 1])],
+                [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}], 30)
+            rd.save(ring_fname, format_version=version)
+
+            meta_only = ring.RingData.load(ring_fname, metadata_only=True)
+            self.assertEqual([
+                {'id': 0, 'zone': 0, 'region': 1},
+                {'id': 1, 'zone': 1, 'region': 1},
+            ], meta_only.devs)
+            self.assertEqual([], meta_only._replica2part2dev_id)
+            rd2 = ring.RingData.load(ring_fname)
+            self.assert_ring_data_equal(rd, rd2)
+
+        test_format(1)
+        test_format(2)
 
     def test_load_closes_file(self):
         def test_format_version(vrs):

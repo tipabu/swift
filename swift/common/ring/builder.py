@@ -35,12 +35,10 @@ from time import time
 from swift.common import exceptions
 from swift.common.ring.ring import RingData
 from swift.common.ring.utils import tiers_for_dev, build_tier_tree, \
-    validate_and_normalize_address, validate_replicas_by_tier, pretty_dev
+    validate_and_normalize_address, validate_replicas_by_tier, pretty_dev, \
+    none_dev_id
 
-# we can't store None's in the replica2part2dev array, so we high-jack
-# the max value for magic to represent the part is not currently
-# assigned to any device.
-NONE_DEV = 2 ** 16 - 1
+NONE_DEV = none_dev_id(2)
 MAX_BALANCE = 999.99
 MAX_BALANCE_GATHER_COUNT = 3
 

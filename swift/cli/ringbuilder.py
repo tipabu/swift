@@ -1179,13 +1179,24 @@ swift-ring-builder <builder_file> rebalance [options]
             print('-' * 79)
             status = EXIT_WARNING
         ts = time()
-        builder.get_ring().save(
-            pathjoin(backup_dir, '%d.' % ts + basename(ring_file)),
-            format_version=options.format_version)
-        builder.save(pathjoin(backup_dir, '%d.' % ts + basename(builder_file)))
-        builder.get_ring().save(
-            ring_file, format_version=options.format_version)
-        builder.save(builder_file)
+        try:
+            builder.get_ring().save(
+                pathjoin(backup_dir, '%d.' % ts + basename(ring_file)),
+                format_version=options.format_version)
+        except exceptions.DevIdBytesTooSmall:
+            print('-' * 79)
+            print("Too many devices in ring.")
+            if options.format_version == 1:
+                print("\nYou may want to try again with --format-version=2\n"
+                      "if all nodes have been upgraded to understand it.")
+            print('-' * 79)
+            exit(EXIT_ERROR)
+        else:
+            builder.save(
+                pathjoin(backup_dir, '%d.' % ts + basename(builder_file)))
+            builder.get_ring().save(
+                ring_file, format_version=options.format_version)
+            builder.save(builder_file)
         exit(status)
 
     @staticmethod
@@ -1326,10 +1337,20 @@ swift-ring-builder <builder_file> write_ring
                 print('Warning: Writing a ring with no partition '
                       'assignments but with devices; did you forget to run '
                       '"rebalance"?')
-        ring_data.save(
-            pathjoin(backup_dir, '%d.' % time() + basename(ring_file)),
-            format_version=options.format_version)
-        ring_data.save(ring_file, format_version=options.format_version)
+        try:
+            ring_data.save(
+                pathjoin(backup_dir, '%d.' % time() + basename(ring_file)),
+                format_version=options.format_version)
+        except exceptions.DevIdBytesTooSmall:
+            print('-' * 79)
+            print("Too many devices in ring.")
+            if options.format_version == 1:
+                print("\nYou may want to try again with --format-version=2\n"
+                      "if all nodes have been upgraded to understand it.")
+            print('-' * 79)
+            exit(EXIT_ERROR)
+        else:
+            ring_data.save(ring_file, format_version=options.format_version)
         exit(EXIT_SUCCESS)
 
     @staticmethod

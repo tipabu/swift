@@ -12,6 +12,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import array
 from collections import defaultdict
 import optparse
 import re
@@ -29,6 +30,40 @@ BYTES_TO_TYPE_CODE = {
     # This just seems excessive; besides, array.array() only takes it on py33+
     # 8: 'Q',
 }
+
+
+def none_dev_id(dev_id_bytes):
+    '''
+    we can't store None's in the replica2part2dev array, so we high-jack
+    the max value for magic to represent the part is not currently
+    assigned to any device.
+    '''
+    return 2 ** (8 * dev_id_bytes) - 1
+
+
+def calculate_minimum_dev_id_bytes(max_dev_id):
+    if max_dev_id < 0:
+        raise ValueError("Can't have negative device IDs")
+    for x in sorted(BYTES_TO_TYPE_CODE):
+        if max_dev_id < none_dev_id(x):
+            return x
+    else:
+        # > 4B devices??
+        raise ValueError('Way too many devices!')
+
+
+def resized_array(old_arr, new_dev_id_bytes):
+    '''
+    Return a copy of ``old_arr`` with itemsize ``new_dev_id_bytes``.
+
+    Note that none_dev_id values are preserved.
+    '''
+    old_none_dev = none_dev_id(old_arr.itemsize)
+    new_none_dev = none_dev_id(new_dev_id_bytes)
+    return array.array(
+        BYTES_TO_TYPE_CODE[new_dev_id_bytes],
+        (new_none_dev if dev_id == old_none_dev else dev_id
+         for dev_id in old_arr))
 
 
 def tiers_for_dev(dev):

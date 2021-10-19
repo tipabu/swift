@@ -32,9 +32,10 @@ import zlib
 import six
 from six.moves import range
 
-from swift.common.exceptions import RingLoadError
+from swift.common.exceptions import RingLoadError, DevIdBytesTooSmall
 from swift.common.utils import hash_path, validate_configuration, md5
-from swift.common.ring.utils import tiers_for_dev, BYTES_TO_TYPE_CODE
+from swift.common.ring.utils import tiers_for_dev, BYTES_TO_TYPE_CODE, \
+    calculate_minimum_dev_id_bytes, resized_array
 
 
 DEFAULT_RING_FORMAT_VERSION = 1
@@ -196,6 +197,27 @@ class RingData(object):
         """Number of replicas (full or partial) used in the ring."""
         return calc_replica_count(self._replica2part2dev_id)
 
+    def set_dev_id_bytes(self, dev_id_bytes):
+        if dev_id_bytes not in BYTES_TO_TYPE_CODE:
+            raise ValueError('dev_id_bytes must be None or one of %r'
+                             % (tuple(BYTES_TO_TYPE_CODE),))
+
+        if dev_id_bytes == self._replica2part2dev_id[0].itemsize:
+            return  # Already done!
+        min_dev_id_bytes = calculate_minimum_dev_id_bytes(len(self.devs) - 1)
+        if min_dev_id_bytes > dev_id_bytes:
+            raise DevIdBytesTooSmall('Too many devices for %d-byte '
+                                     'device ids' % dev_id_bytes)
+
+        self._replica2part2dev_id = [
+            resized_array(part2dev_id, dev_id_bytes)
+            for part2dev_id in self._replica2part2dev_id]
+
+    def calculate_and_update_dev_id_bytes(self):
+        new_dev_id_bytes = calculate_minimum_dev_id_bytes(len(self.devs) - 1)
+        self.set_dev_id_bytes(new_dev_id_bytes)
+        return new_dev_id_bytes
+
     @classmethod
     def deserialize_v1(cls, gz_file, metadata_only=False):
         """
@@ -311,6 +333,7 @@ class RingData(object):
     def serialize_v1(self, file_obj):
         # Write out new-style serialization magic and version:
         file_obj.write(struct.pack('!4sH', b'R1NG', 1))
+        self.set_dev_id_bytes(2)
         ring = self.to_dict()
 
         # Only include next_part_power if it is set in the
@@ -342,12 +365,13 @@ class RingData(object):
     def serialize_v2(self, file_obj):
         # Write out new-style serialization magic and version:
         file_obj.write(struct.pack('!4sH', b'R1NG', 2))
+        new_dev_id_bytes = self.calculate_and_update_dev_id_bytes()
         ring = self.to_dict()
 
         # Only include next_part_power if it is set in the
         # builder, otherwise just ignore it
         _text = {'devs': ring['devs'], 'part_shift': ring['part_shift'],
-                 'dev_id_bytes': 2}
+                 'dev_id_bytes': new_dev_id_bytes}
 
         if ring['version'] is not None:
             _text['version'] = ring['version']
@@ -363,7 +387,7 @@ class RingData(object):
         file_obj.write(json_text)
 
         assignments = sum(len(a) for a in ring['replica2part2dev_id'])
-        file_obj.write(struct.pack('!Q', 2 * assignments))
+        file_obj.write(struct.pack('!Q', new_dev_id_bytes * assignments))
 
         for part2dev_id in ring['replica2part2dev_id']:
             with network_order_array(part2dev_id):

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import array
 import sys
 import unittest
 from collections import defaultdict
@@ -30,7 +31,9 @@ from swift.common.ring.utils import (tiers_for_dev, build_tier_tree,
                                      parse_builder_ring_filename_args,
                                      build_dev_from_opts, dispersion_report,
                                      parse_address, get_tier_name, pretty_dev,
-                                     validate_replicas_by_tier)
+                                     validate_replicas_by_tier, none_dev_id,
+                                     calculate_minimum_dev_id_bytes,
+                                     resized_array)
 
 
 class TestUtils(unittest.TestCase):
@@ -784,6 +787,47 @@ class TestUtils(unittest.TestCase):
         expected = 'r1z1-127.0.0.1/d1'
         self.assertEqual(expected, get_tier_name(tiers_for_dev(dev)[-1], rb))
         self.assertEqual(expected, pretty_dev(dev))
+
+    def test_none_dev_id(self):
+        self.assertEqual(none_dev_id(1), 0xff)
+        self.assertEqual(none_dev_id(2), 0xffff)
+        self.assertEqual(none_dev_id(4), 0xffffffff)
+        # Never used, but can calculate
+        self.assertEqual(none_dev_id(3), 0xffffff)
+
+    def test_calculate_minimum_dev_id_bytes(self):
+        self.assertEqual(calculate_minimum_dev_id_bytes(0), 1)
+        self.assertEqual(calculate_minimum_dev_id_bytes(254), 1)
+        self.assertEqual(calculate_minimum_dev_id_bytes(255), 2)
+        self.assertEqual(calculate_minimum_dev_id_bytes(65534), 2)
+        self.assertEqual(calculate_minimum_dev_id_bytes(65535), 4)
+        self.assertEqual(calculate_minimum_dev_id_bytes(4294967294), 4)
+        with self.assertRaises(ValueError):
+            calculate_minimum_dev_id_bytes(-1)
+        # You'd probably run into memory problems before you got here, but...
+        with self.assertRaises(ValueError):
+            calculate_minimum_dev_id_bytes(4294967295)
+        with self.assertRaises(ValueError):
+            calculate_minimum_dev_id_bytes(1e99)
+
+    def test_resized_array(self):
+        a = array.array('B', range(256))
+        self.assertEqual(a.itemsize, 1)
+        b = resized_array(a, 4)
+        self.assertEqual(b.itemsize, 4)
+        self.assertEqual(list(a)[:-1], list(b)[:-1])
+        self.assertEqual(b[-1], none_dev_id(4))
+
+        a = array.array('H', [none_dev_id(2), 8, 6, 7, 5, 3, 0, 9])
+        self.assertEqual(a.itemsize, 2)
+        b = resized_array(a, 1)
+        self.assertEqual(b.itemsize, 1)
+        self.assertEqual(list(a)[1:], list(b)[1:])
+        self.assertEqual(b[0], none_dev_id(1))
+
+        # Caller must ensure the items all fit in the new width
+        with self.assertRaises(OverflowError):
+            resized_array(array.array('H', [1024]), 1)
 
 
 if __name__ == '__main__':
