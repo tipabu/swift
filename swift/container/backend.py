@@ -1100,7 +1100,7 @@ class ContainerBroker(DatabaseBroker):
                           path=None, storage_policy_index=0, reverse=False,
                           include_deleted=False, since_row=None,
                           transform_func=None, all_policies=False,
-                          allow_reserved=False):
+                          allow_reserved=False, delimiter_depth=1):
         """
         Get a list of objects sorted by name starting at marker onward, up
         to limit entries.  Entries will begin with the prefix and will not
@@ -1153,6 +1153,7 @@ class ContainerBroker(DatabaseBroker):
             if path:
                 prefix = path = path.rstrip('/') + '/'
             delimiter = '/'
+            delimiter_depth = 1
         elif delimiter and not prefix:
             prefix = ''
         if prefix:
@@ -1243,33 +1244,36 @@ class ContainerBroker(DatabaseBroker):
                     if len(results) >= limit:
                         curs.close()
                         return results
-                    end = name.find(delimiter, len(prefix))
+                    end = len(prefix)
+                    for _ in range(delimiter_depth):
+                        end = name.find(delimiter, end)
+                        if end < 0:
+                            break
+                        end += len(delimiter)
                     if path is not None:
                         if name == path:
                             continue
-                        if end >= 0 and len(name) > end + len(delimiter):
+                        if end >= 0 and len(name) > end:
                             if reverse:
-                                end_marker = name[:end + len(delimiter)]
+                                end_marker = name[:end]
                             else:
                                 marker = ''.join([
-                                    name[:end],
-                                    delimiter[:-1],
+                                    name[:end - 1],
                                     chr(ord(delimiter[-1:]) + 1),
                                 ])
                             curs.close()
                             break
                     elif end >= 0:
                         if reverse:
-                            end_marker = name[:end + len(delimiter)]
+                            end_marker = name[:end]
                         else:
                             marker = ''.join([
-                                name[:end],
-                                delimiter[:-1],
+                                name[:end - 1],
                                 chr(ord(delimiter[-1:]) + 1),
                             ])
                             # we want result to be inclusive of delim+1
                             delim_force_gte = True
-                        dir_name = name[:end + len(delimiter)]
+                        dir_name = name[:end]
                         if dir_name != orig_marker:
                             results.append([dir_name, '0', 0, None, ''])
                         curs.close()

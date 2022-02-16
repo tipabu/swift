@@ -29,7 +29,7 @@ from swift.common.header_key_dict import HeaderKeyDict
 
 from swift import gettext_ as _
 from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX, \
-    CONTAINER_LISTING_LIMIT
+    CONTAINER_LISTING_LIMIT, MAX_DELIMITER_DEPTH
 from swift.common.storage_policy import POLICIES
 from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.http import is_success, is_server_error
@@ -132,6 +132,15 @@ def validate_container_params(req):
                                    'delimiter', 'path', 'format', 'reverse',
                                    'states', 'includes'))
     params['limit'] = constrain_req_limit(req, CONTAINER_LISTING_LIMIT)
+
+    given_depth = get_param(req, 'delimiter-depth')
+    depth = 1
+    if given_depth and given_depth.isdigit():
+        given_depth = int(given_depth)
+        if 1 <= given_depth <= MAX_DELIMITER_DEPTH:
+            depth = given_depth
+    params['delimiter-depth'] = depth
+
     return params
 
 

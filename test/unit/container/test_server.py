@@ -4436,6 +4436,36 @@ class TestContainerController(unittest.TestCase):
              {"subdir": "US-TX-"},
              {"subdir": "US-UT-"}])
 
+    def test_GET_delimiter_depth(self):
+        req = Request.blank(
+            '/sda1/p/a/c', environ={'REQUEST_METHOD': 'PUT',
+                                    'HTTP_X_TIMESTAMP': '0'})
+        resp = req.get_response(self.controller)
+        for i in ('UK-X', 'UK-Y', 'US-TX-A', 'US-TX-B', 'US-OK-A', 'US-OK-B',
+                  'US-UT-A'):
+            req = Request.blank(
+                '/sda1/p/a/c/%s' % i,
+                environ={
+                    'REQUEST_METHOD': 'PUT', 'HTTP_X_TIMESTAMP': '1',
+                    'HTTP_X_CONTENT_TYPE': 'text/plain', 'HTTP_X_ETAG': 'x',
+                    'HTTP_X_SIZE': 0})
+            self._update_object_put_headers(req)
+            resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, 201)
+        req = Request.blank(
+            '/sda1/p/a/c?delimiter=-&delimiter-depth=2&format=json',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            json.loads(resp.body),
+            [{"name": "UK-X", "hash": "x", "content_type": "text/plain",
+              "bytes": 0, "last_modified": "1970-01-01T00:00:01.000000"},
+             {"name": "UK-Y", "hash": "x", "content_type": "text/plain",
+              "bytes": 0, "last_modified": "1970-01-01T00:00:01.000000"},
+             {"subdir": "US-OK-"},
+             {"subdir": "US-TX-"},
+             {"subdir": "US-UT-"}])
+
     def test_GET_multichar_delimiter(self):
         self.maxDiff = None
         req = Request.blank(

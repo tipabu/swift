@@ -37,6 +37,7 @@ CONTAINER_LISTING_LIMIT = 10000
 ACCOUNT_LISTING_LIMIT = 10000
 MAX_ACCOUNT_NAME_LENGTH = 256
 MAX_CONTAINER_NAME_LENGTH = 256
+MAX_DELIMITER_DEPTH = 5
 VALID_API_VERSIONS = ["v1", "v1.0"]
 EXTRA_HEADER_COUNT = 0
 AUTO_CREATE_ACCOUNT_PREFIX = '.'
@@ -57,6 +58,7 @@ DEFAULT_CONSTRAINTS = {
     'account_listing_limit': ACCOUNT_LISTING_LIMIT,
     'max_account_name_length': MAX_ACCOUNT_NAME_LENGTH,
     'max_container_name_length': MAX_CONTAINER_NAME_LENGTH,
+    'max_delimiter_depth': MAX_DELIMITER_DEPTH,
     'valid_api_versions': VALID_API_VERSIONS,
     'extra_header_count': EXTRA_HEADER_COUNT,
     'auto_create_account_prefix': AUTO_CREATE_ACCOUNT_PREFIX,
