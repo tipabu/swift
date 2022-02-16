@@ -745,6 +745,35 @@ class TestContainer(Base):
                                     'reverse': 'yes'})
         self.assertEqual(results, ['baza', 'bar'])
 
+    def testListDelimiterDepthAndPrefix(self):
+        cont = self.env.account.container(Utils.create_name())
+        self.assertTrue(cont.create())
+
+        delimiter = 'a'
+        files = ['apple', 'banana', 'bar', 'bazaar']
+        for f in files:
+            file_item = cont.file(f)
+            self.assertTrue(file_item.write_random())
+
+        results = cont.files(parms={'delimiter': delimiter,
+                                    'delimiter-depth': '2'})
+        self.assertEqual(results, ['apple', 'bana', 'bar', 'baza'])
+
+        results = cont.files(parms={'delimiter': delimiter,
+                                    'delimiter-depth': '2',
+                                    'reverse': 'true'})
+        self.assertEqual(results, ['baza', 'bar', 'bana', 'apple'])
+
+        results = cont.files(parms={'prefix': 'ba', 'delimiter': delimiter,
+                                    'delimiter-depth': '2'})
+        self.assertEqual(results, ['banana', 'bar', 'bazaa'])
+
+        results = cont.files(parms={'prefix': 'ba',
+                                    'delimiter': delimiter,
+                                    'delimiter-depth': '2',
+                                    'reverse': 'yes'})
+        self.assertEqual(results, ['bazaa', 'bar', 'banana'])
+
     def testLeadingDelimiter(self):
         cont = self.env.account.container(Utils.create_name())
         self.assertTrue(cont.create())

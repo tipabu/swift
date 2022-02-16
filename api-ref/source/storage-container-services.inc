@@ -55,6 +55,7 @@ Request
    - prefix: prefix
    - format: format
    - delimiter: delimiter
+   - delimiter-depth: delimiter-depth
    - path: path
    - reverse: reverse
    - X-Auth-Token: X-Auth-Token

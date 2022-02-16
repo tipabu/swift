@@ -3281,6 +3281,15 @@ class TestContainerBroker(test_db.TestDbBase):
         listing = broker.list_objects_iter(100, None, None, None, '/')
         self.assertEqual([row[0] for row in listing],
                          ['/'])
+        listing = broker.list_objects_iter(100, None, None, None, '/',
+                                           delimiter_depth=2)
+        self.assertEqual([row[0] for row in listing],
+                         ['/pets/', '/snakes'])
+        listing = broker.list_objects_iter(100, None, None, '/', '/',
+                                           delimiter_depth=2)
+        self.assertEqual([row[0] for row in listing],
+                         ['/pets/dogs/', '/pets/fish/', '/pets/fish_info.txt',
+                          '/snakes'])
 
     def test_list_objects_iter_order_and_reverse(self):
         # Test ContainerBroker.list_objects_iter

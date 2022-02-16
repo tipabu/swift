@@ -180,6 +180,7 @@ aliases = yellow, orange
 
 # account_listing_limit is the default (and max) number of items returned
 # for an account listing request
+
 #account_listing_limit = 10000
 
 
@@ -195,6 +196,12 @@ aliases = yellow, orange
 #max_container_name_length = 256
 
 
+# delimiter-depth values larger than this will be ignored, instead using the
+# default value of 1
+
+#max_delimiter_depth = 5
+
+
 # By default all REST API calls should use "v1" or "v1.0" as the version string,
 # for example "/v1/account". This can be manually overridden to make this
 # backward-compatible, in case a different version string has been used before.
@@ -204,6 +211,7 @@ aliases = yellow, orange
 # api versions are by default excluded from /info.
 
 # valid_api_versions = v1,v1.0
+
 
 # The prefix used for hidden auto-created accounts, for example accounts in
 # which shard containers are created. It defaults to '.'; don't change it.

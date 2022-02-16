@@ -715,6 +715,7 @@ class ContainerController(BaseStorageServer):
         marker = params.get('marker', '')
         end_marker = params.get('end_marker')
         limit = params['limit']
+        delimiter_depth = params['delimiter-depth']
         reverse = config_true_value(params.get('reverse'))
         out_content_type = listing_formats.get_listing_content_type(req)
         try:
@@ -782,7 +783,8 @@ class ContainerController(BaseStorageServer):
             container_list = src_broker.list_objects_iter(
                 limit, marker, end_marker, prefix, delimiter, path,
                 storage_policy_index=storage_policy_index,
-                reverse=reverse, allow_reserved=req.allow_reserved_names)
+                reverse=reverse, allow_reserved=req.allow_reserved_names,
+                delimiter_depth=delimiter_depth)
         return self.create_listing(req, out_content_type, info, resp_headers,
                                    broker.metadata, container_list, container)
 

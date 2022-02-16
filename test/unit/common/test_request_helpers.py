@@ -78,22 +78,26 @@ class TestRequestHelpers(unittest.TestCase):
     def test_validate_container_params(self):
         req = Request.blank('')
         actual = rh.validate_container_params(req)
-        self.assertEqual({'limit': 10000}, actual)
+        self.assertEqual({'limit': 10000, 'delimiter-depth': 1}, actual)
 
-        req = Request.blank('', query_string='limit=1&junk=here&marker=foo')
+        req = Request.blank(
+            '', query_string='limit=1&junk=here&marker=foo&delimiter-depth=3')
         actual = rh.validate_container_params(req)
-        expected = {'limit': 1, 'marker': 'foo'}
+        expected = {'limit': 1, 'marker': 'foo', 'delimiter-depth': 3}
         self.assertEqual(expected, actual)
 
-        req = Request.blank('', query_string='limit=1&junk=here&marker=')
+        req = Request.blank(
+            '', query_string='limit=1&junk=here&marker=&delimiter-depth=9')
         actual = rh.validate_container_params(req)
-        expected = {'limit': 1, 'marker': ''}
+        # delimiter-depth gets ignored when it's too high
+        expected = {'limit': 1, 'marker': '', 'delimiter-depth': 1}
         self.assertEqual(expected, actual)
 
         # ignore bad junk
-        req = Request.blank('', query_string='limit=1&junk=%ff&marker=foo')
+        req = Request.blank(
+            '', query_string='limit=1&junk=%ff&marker=foo&delimiter-depth=two')
         actual = rh.validate_container_params(req)
-        expected = {'limit': 1, 'marker': 'foo'}
+        expected = {'limit': 1, 'marker': 'foo', 'delimiter-depth': 1}
         self.assertEqual(expected, actual)
 
         # error on bad wanted parameter
