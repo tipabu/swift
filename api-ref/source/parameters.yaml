@@ -1003,13 +1003,22 @@ bulk-delete:
   type: string
 delimiter:
   description: |
-    The delimiter is a single character used to split object
+    The delimiter is a string used to split object
     names to present a pseudo-directory hierarchy of objects. When combined
     with a ``prefix`` query, this enables API users to simulate and
     traverse the objects in a container as if they were in a directory tree.
   in: query
   required: false
   type: string
+delimiter-depth:
+  description: |
+    When used with the ``delimiter`` parameter, the number of instances of the
+    delimiter to include after the ``prefix`` before collapsing items into a
+    pseudo-directory. The effect is similar to the ``-maxdepth`` option for
+    ``find``. Excessively large values will be ignored. The default value is 1.
+  in: query
+  required: false
+  type: integer
 end_marker:
   description: |
     For a string value, `x` , constrains the list to items whose names
