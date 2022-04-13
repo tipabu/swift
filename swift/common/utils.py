@@ -6668,6 +6668,69 @@ def get_db_files(db_path):
     return sorted(results)
 
 
+def get_pid_notify_socket(pid=None):
+    if pid is None:
+        pid = os.getpid()
+    return '\0swift-notifications\0' + str(pid)
+
+
+class NotificationServer(object):
+    def __init__(self, pid, read_timeout):
+        self.pid = pid
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            self.sock.bind(get_pid_notify_socket(self.pid))
+            self.sock.settimeout(read_timeout)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        except BaseException:
+            self.sock.close()
+            raise
+
+    def discard_handler(self, data, ancdata, flags, addr):
+        '''
+        Extension point for subclasses to handle unexpected ancillary data
+        '''
+        pass
+
+    def recv_from_pid(self, bufsize):
+        while True:
+            try:
+                data, ancdata, flags, addr = self.sock.recvmsg(
+                    1024, socket.CMSG_LEN(struct.calcsize("3i")))
+            except OSError as e:
+                if e.errno == errno.EAGAIN:
+                    time.sleep(0.1)
+                    continue
+                raise
+
+            if len(ancdata) != 1:
+                self.discard_handler(data, ancdata, flags, addr)
+                continue
+
+            cmsg_level, cmsg_type, cmsg_data = ancdata[0]
+            if (cmsg_level, cmsg_type, len(cmsg_data)) != (
+                    socket.SOL_SOCKET, socket.SCM_CREDENTIALS,
+                    struct.calcsize("3i")):
+                self.discard_handler(data, ancdata, flags, addr)
+                continue
+
+            pid, uid, gid = struct.unpack("3i", cmsg_data)
+            if pid != self.pid:
+                self.discard_handler(data, ancdata, flags, addr)
+                continue
+
+            return data
+
+    def close(self):
+        self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
 def systemd_notify(logger=None, msg=b"READY=1"):
     """
     Notify the service manager that started this process, if it is
@@ -6681,8 +6744,12 @@ def systemd_notify(logger=None, msg=b"READY=1"):
     """
     if not isinstance(msg, bytes):
         msg = msg.encode('utf8')
-    notify_socket = os.getenv('NOTIFY_SOCKET')
-    if notify_socket:
+
+    notify_sockets = [get_pid_notify_socket()]
+    systemd_socket = os.getenv('NOTIFY_SOCKET')
+    if systemd_socket:
+        notify_sockets.append(systemd_socket)
+    for notify_socket in notify_sockets:
         if notify_socket.startswith('@'):
             # abstract namespace socket
             notify_socket = '\0%s' % notify_socket[1:]
@@ -6691,8 +6758,9 @@ def systemd_notify(logger=None, msg=b"READY=1"):
             try:
                 sock.connect(notify_socket)
                 sock.sendall(msg)
-            except EnvironmentError:
-                if logger:
+            except EnvironmentError as e:
+                if logger and not (notify_socket == notify_sockets[0] and
+                                   e.errno == errno.ECONNREFUSED):
                     logger.debug("Systemd notification failed", exc_info=True)
 
 
