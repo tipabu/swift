@@ -861,11 +861,18 @@ class TestRingBuilder(unittest.TestCase):
         rb.add_dev({'id': 2, 'region': 0, 'zone': 2, 'weight': 1,
                     'ip': '127.0.0.1', 'port': 10002, 'device': 'sda1'})
         self.assertFalse(rb.ever_rebalanced)
+        self.assertFalse(rb._past2part2index)
+        self.assertFalse(rb._past2part2dev_id)
         builder_file = os.path.join(self.testdir, 'test.buider')
         rb.save(builder_file)
         rb = ring.RingBuilder.load(builder_file)
         self.assertFalse(rb.ever_rebalanced)
         rb.rebalance()
+        # past2part2* tables should be empty because this is the first
+        # rebalance so so no old_replica2part2dev exists to be sent to
+        # _build_dispersion_graph
+        self.assertFalse(rb._past2part2index)
+        self.assertFalse(rb._past2part2dev_id)
         self.assertTrue(rb.ever_rebalanced)
         rb.save(builder_file)
         rb = ring.RingBuilder.load(builder_file)
@@ -882,6 +889,11 @@ class TestRingBuilder(unittest.TestCase):
         self.assertFalse(rb.ever_rebalanced)
         rb.rebalance()
         self.assertTrue(rb.ever_rebalanced)
+        # past2part2* tables should be empty because this is the first
+        # rebalance so so no old_replica2part2dev exists to be sent to
+        # _build_dispersion_graph
+        self.assertFalse(rb._past2part2index)
+        self.assertFalse(rb._past2part2dev_id)
         counts = _partition_counts(rb)
         self.assertEqual(counts, {0: 256, 1: 256, 2: 256})
         rb.add_dev({'id': 3, 'region': 0, 'zone': 3, 'weight': 1,
@@ -891,10 +903,108 @@ class TestRingBuilder(unittest.TestCase):
         self.assertTrue(rb.ever_rebalanced)
         counts = _partition_counts(rb)
         self.assertEqual(counts, {0: 192, 1: 192, 2: 192, 3: 192})
+        # we now have some parts moved so it isn't all NONE_DEVs any more
+        # maybe we need to find a rebalance seed that works for both
+        # py2 and py3
+        expected_past2parts2index = [array(
+            'H', itertools.repeat(utils.none_dev_id(2), rb.parts))]
+        expected_past2parts2dev_id = [array(
+            'H', itertools.repeat(rb.none_dev_id, rb.parts))]
+        self.assertNotEqual(expected_past2parts2index, rb._past2part2index)
+        self.assertNotEqual(expected_past2parts2dev_id, rb._past2part2dev_id)
+        old_past2parts2index = rb._past2part2index
+        old_past2parts2dev_id = rb._past2part2dev_id
         rb.set_dev_weight(3, 100)
         rb.rebalance()
         counts = _partition_counts(rb)
         self.assertEqual(counts[3], 256)
+        self.assertNotEqual(old_past2parts2index, rb._past2part2index)
+        self.assertNotEqual(old_past2parts2dev_id, rb._past2part2dev_id)
+
+    @unittest.skipIf(sys.version_info < (3,),
+                     "Seed-specific test that only works on PY3")
+    def test_rebalance_with_history(self):
+        rb = ring.RingBuilder(3, 3, 1)
+        rb.history_count = 2
+        rb.add_dev({'id': 0, 'region': 0, 'zone': 0, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10000, 'device': 'sda1'})
+        rb.add_dev({'id': 1, 'region': 0, 'zone': 1, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10001, 'device': 'sda1'})
+        rb.add_dev({'id': 2, 'region': 0, 'zone': 2, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10002, 'device': 'sda1'})
+        self.assertFalse(rb.ever_rebalanced)
+        rb.rebalance(seed=1)
+        self.assertTrue(rb.ever_rebalanced)
+        # past2part2* tables should be empty because this is the first
+        # rebalance so so no old_replica2part2dev exists to be sent to
+        # _build_dispersion_graph
+        self.assertFalse(rb._past2part2index)
+        self.assertFalse(rb._past2part2dev_id)
+
+        # Let's get a node that we know will move, say replica 0 part 1
+        orig_node_replica = 0
+        orig_node = rb.devs[rb._replica2part2dev[orig_node_replica][1]]
+
+        rb.add_dev({'id': 3, 'region': 0, 'zone': 3, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10003, 'device': 'sda1'})
+        rb.pretend_min_part_hours_passed()
+        rb.rebalance(seed=1)
+        self.assertTrue(rb.ever_rebalanced)
+        self.assertEqual(len(rb._past2part2dev_id), 1)
+        self.assertEqual(len(rb._past2part2index), 1)
+
+        # partition 4 didn't move, so there shouldn't be a last_part device
+        # there.
+        self.assertEqual(rb._past2part2dev_id[0][4], rb.none_dev_id)
+
+        # but replica 0 part 1 did.
+        new_node = rb.devs[rb._replica2part2dev[orig_node_replica][1]]
+        self.assertNotEqual(orig_node, new_node)
+        # but it is in ring history for that partition, index 0 is the last
+        # rebalance
+        self.assertEqual(orig_node, rb.devs[rb._past2part2dev_id[0][1]])
+        # and where did it live
+        self.assertEqual(
+            orig_node_replica, rb._past2part2index[0][1])
+
+        # let's mix things around again
+        rb.add_dev({'id': 4, 'region': 0, 'zone': 4, 'weight': 1,
+                    'ip': '127.0.0.1', 'port': 10004, 'device': 'sda1'})
+        rb.pretend_min_part_hours_passed()
+        rb.rebalance(seed=1)
+        self.assertEqual(len(rb._past2part2dev_id), 2)
+        self.assertEqual(len(rb._past2part2index), 2)
+
+        # Turns out the same index on the same replica moved again
+        self.assertNotEqual(
+            new_node, rb.devs[rb._replica2part2dev[orig_node_replica][1]])
+        self.assertEqual(new_node, rb.devs[rb._past2part2dev_id[0][1]])
+        # and where did it live
+        self.assertEqual(
+            orig_node_replica, rb._past2part2index[0][1])
+
+        # we can still find the older historic data
+        self.assertEqual(orig_node, rb.devs[rb._past2part2dev_id[1][1]])
+        # and where did it live
+        self.assertEqual(
+            orig_node_replica, rb._past2part2index[1][1])
+
+        # but we are only keeping 2 rebalances of info so
+        rb.remove_dev(4)
+        rb.pretend_min_part_hours_passed()
+        rb.rebalance(seed=1)
+        # still only 2 historic entries
+        self.assertEqual(len(rb._past2part2dev_id), 2)
+        self.assertEqual(len(rb._past2part2index), 2)
+
+        # oldest data is gone
+        self.assertNotEqual(orig_node, rb.devs[rb._past2part2dev_id[1][1]])
+
+        # newer history has moved along
+        self.assertEqual(new_node, rb.devs[rb._past2part2dev_id[1][1]])
+        # and where did it live
+        self.assertEqual(
+            orig_node_replica, rb._past2part2index[1][1])
 
     def test_add_rebalance_add_rebalance_delete_rebalance(self):
         # Test for https://bugs.launchpad.net/swift/+bug/845952
@@ -1442,25 +1552,26 @@ class TestRingBuilder(unittest.TestCase):
                          [256, 256, 25])
 
         rb.replicas = 2.2
-        rb.rebalance()
+        changed_parts, _, _ = rb.rebalance()
         rb.validate()
         self.assertEqual([len(p2d) for p2d in rb._replica2part2dev],
                          [256, 256, 51])
+        self.assertEqual(changed_parts, 26)
 
     def test_set_replicas_decrease(self):
         rb = ring.RingBuilder(4, 5, 0)
         rb.add_dev({'id': 0, 'region': 0, 'zone': 0, 'weight': 1,
                     'ip': '127.0.0.1', 'port': 10000, 'device': 'sda1'})
         rb.add_dev({'id': 1, 'region': 0, 'zone': 1, 'weight': 1,
-                    'ip': '127.0.0.1', 'port': 10001, 'device': 'sda1'})
+                    'ip': '127.0.0.2', 'port': 10001, 'device': 'sda1'})
         rb.add_dev({'id': 2, 'region': 0, 'zone': 0, 'weight': 1,
-                    'ip': '127.0.0.1', 'port': 10000, 'device': 'sda1'})
+                    'ip': '127.0.0.3', 'port': 10000, 'device': 'sda1'})
         rb.add_dev({'id': 3, 'region': 0, 'zone': 1, 'weight': 1,
-                    'ip': '127.0.0.1', 'port': 10001, 'device': 'sda1'})
+                    'ip': '127.0.0.4', 'port': 10001, 'device': 'sda1'})
         rb.add_dev({'id': 4, 'region': 0, 'zone': 0, 'weight': 1,
-                    'ip': '127.0.0.1', 'port': 10000, 'device': 'sda1'})
+                    'ip': '127.0.0.5', 'port': 10000, 'device': 'sda1'})
         rb.add_dev({'id': 5, 'region': 0, 'zone': 1, 'weight': 1,
-                    'ip': '127.0.0.1', 'port': 10001, 'device': 'sda1'})
+                    'ip': '127.0.0.6', 'port': 10001, 'device': 'sda1'})
         rb.rebalance()
         rb.validate()
 
@@ -1478,6 +1589,10 @@ class TestRingBuilder(unittest.TestCase):
 
         self.assertEqual([len(p2d) for p2d in rb._replica2part2dev],
                          [16, 16, 8])
+
+        self.assertEqual([sum(1 for d in p2d if d != rb.none_dev_id)
+                          for p2d in rb._past2part2dev_id],
+                         [16])
 
     def test_fractional_replicas_rebalance(self):
         rb = ring.RingBuilder(8, 2.5, 0)
@@ -2057,6 +2172,8 @@ class TestRingBuilder(unittest.TestCase):
         self.maxDiff = None
         self.assertEqual(loaded_rb.to_dict(), rb.to_dict())
         self.assertEqual(loaded_rb.overload, 3.14159)
+        self.assertEqual(loaded_rb._past2part2index, rb._past2part2index)
+        self.assertEqual(loaded_rb._past2part2dev_id, rb._past2part2dev_id)
 
     @mock.patch('six.moves.builtins.open', autospec=True)
     @mock.patch('swift.common.ring.builder.pickle.dump', autospec=True)
@@ -2817,6 +2934,11 @@ class TestPartPowerIncrease(unittest.TestCase):
             dev = "sdx%s" % i
             rb.add_dev({'id': i, 'region': 0, 'zone': 0, 'weight': 1,
                         'ip': '127.0.0.1', 'port': 10000, 'device': dev})
+            if i == 4:
+                # rebalance midway through
+                rb.rebalance(seed=1)
+                rb.pretend_min_part_hours_passed()
+        # ... so *this* rebalance populates the past2part2dev table
         rb.rebalance(seed=1)
 
         # Let's save the ring, and get the nodes for an object
@@ -2825,6 +2947,9 @@ class TestPartPowerIncrease(unittest.TestCase):
         rd.save(ring_file, format_version=self.FORMAT_VERSION)
         r = ring.Ring(ring_file)
         old_part, old_nodes = r.get_nodes("acc", "cont", "obj")
+        old_last_nodes = list(r.get_last_part_nodes(old_part))
+        if self.FORMAT_VERSION == 2:
+            self.assertTrue(old_last_nodes)
         old_version = rb.version
 
         self.assertTrue(rb.prepare_increase_partition_power())
@@ -2844,11 +2969,14 @@ class TestPartPowerIncrease(unittest.TestCase):
         rd.save(ring_file, format_version=self.FORMAT_VERSION)
         r = ring.Ring(ring_file)
         new_part, new_nodes = r.get_nodes("acc", "cont", "obj")
+        new_last_nodes = list(r.get_last_part_nodes(new_part))
 
         # sanity checks
         self.assertEqual(9, rb.part_power)
         self.assertEqual(9, rb.next_part_power)
         self.assertEqual(rb.version, old_version + 3)
+        self.assertEqual(old_nodes, new_nodes)
+        self.assertEqual(old_last_nodes, new_last_nodes)
 
         # make sure there is always the same device assigned to every pair of
         # partitions

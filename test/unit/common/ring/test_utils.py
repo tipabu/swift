@@ -12,7 +12,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import array
 import sys
 import unittest
 from collections import defaultdict
@@ -30,7 +30,8 @@ from swift.common.ring.utils import (tiers_for_dev, build_tier_tree,
                                      parse_builder_ring_filename_args,
                                      build_dev_from_opts, dispersion_report,
                                      parse_address, get_tier_name, pretty_dev,
-                                     validate_replicas_by_tier)
+                                     validate_replicas_by_tier, resize_array,
+                                     resize_ringlike)
 
 
 class TestUtils(unittest.TestCase):
@@ -785,6 +786,36 @@ class TestUtils(unittest.TestCase):
         expected = 'r1z1-127.0.0.1/d1'
         self.assertEqual(expected, get_tier_name(tiers_for_dev(dev)[-1], rb))
         self.assertEqual(expected, pretty_dev(dev))
+
+    def test_resize_array(self):
+        # let's start with a 1 byte array
+        arr = array.array('B', range(10))
+        self.assertEqual(arr.itemsize, 1)
+
+        for x in 2, 4, 2, 1:
+            arr = resize_array(arr, x)
+            self.assertEqual(arr.itemsize, x)
+
+        # picking a non-power of 2, fails
+        with self.assertRaises(KeyError):
+            resize_array(arr, 3)
+
+    def test_resize_ringlike(self):
+        # pretty much the same as above but can pass in a list of arrays
+        ringlike = [array.array('B', range(10))
+                    for _ in range(3)]
+
+        def assert_all(rl, expected_itemsize):
+            for row in rl:
+                self.assertEqual(row.itemsize, expected_itemsize)
+
+        for x in 2, 4, 2, 1:
+            ringlike = resize_ringlike(ringlike, x)
+            assert_all(ringlike, x)
+
+        # picking a non-power of 2, fails
+        with self.assertRaises(KeyError):
+            resize_ringlike(ringlike, 3)
 
 
 if __name__ == '__main__':

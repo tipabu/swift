@@ -605,6 +605,8 @@ swift-ring-builder <builder_file>
         builder_dict = builder.get_ring().to_dict()
         # mostly just an implementation detail
         builder_dict.pop('dev_id_bytes', None)
+        if not builder_dict['past2part2dev_id']:
+            builder_dict['history_count'] = 0
 
         # compare ring file against builder file
         if not exists(ring_file):
@@ -1380,6 +1382,9 @@ swift-ring-builder <ring_file> write_builder [min_part_hours]
             '_last_part_moves': None,
             '_last_part_gather_start': 0,
             '_remove_devs': [],
+            'history_count': ring.history_count or 1,
+            '_past2part2index': ring._past2part2index or [],
+            '_past2part2dev_id': ring._past2part2dev_id or [],
         }
         builder = RingBuilder.from_dict(builder_dict)
         for parts in builder._replica2part2dev:
