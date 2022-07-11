@@ -142,10 +142,13 @@ def print_ring_locations(ring, datadir, account, container=None, obj=None,
         part = ring.get_part(account, container, obj)
 
     primary_nodes = ring.get_part_nodes(part)
+    last_primary_nodes = list(ring.get_last_part_nodes(part))
+    last_primary_ids = set(node['id'] for node in last_primary_nodes)
     handoff_nodes = ring.get_more_nodes(part)
     if not all_nodes:
         handoff_nodes = itertools.islice(handoff_nodes, len(primary_nodes))
-    handoff_nodes = list(handoff_nodes)
+    handoff_nodes = [node for node in handoff_nodes
+                     if node['id'] not in last_primary_ids]
 
     if account and not tpart:
         path_hash = hash_path(account, container, obj)
@@ -157,6 +160,9 @@ def print_ring_locations(ring, datadir, account, container=None, obj=None,
     for node in primary_nodes:
         print('Server:Port Device\t%s:%s %s' % (node['ip'], node['port'],
                                                 node['device']))
+    for node in last_primary_nodes:
+        print('Server:Port Device\t%s:%s %s\t [Old primary]' % (
+            node['ip'], node['port'], node['device']))
     for node in handoff_nodes:
         print('Server:Port Device\t%s:%s %s\t [Handoff]' % (
             node['ip'], node['port'], node['device']))
@@ -166,6 +172,11 @@ def print_ring_locations(ring, datadir, account, container=None, obj=None,
     for node in primary_nodes:
         cmd = curl_head_command(node['ip'], node['port'], node['device'],
                                 part, target, policy_index)
+        print(cmd)
+    for node in last_primary_nodes:
+        cmd = curl_head_command(node['ip'], node['port'], node['device'],
+                                part, target, policy_index)
+        cmd += ' # [Old primary]'
         print(cmd)
     for node in handoff_nodes:
         cmd = curl_head_command(node['ip'], node['port'], node['device'],
@@ -180,6 +191,11 @@ def print_ring_locations(ring, datadir, account, container=None, obj=None,
             print('ssh %s "ls -lah ${DEVICE:-/srv/node*}/%s/%s"' %
                   (node['ip'], node['device'],
                    storage_directory(datadir, part, path_hash)))
+        for node in last_primary_nodes:
+            print('ssh %s "ls -lah ${DEVICE:-/srv/node*}/%s/%s"'
+                  ' # [Old primary]' %
+                  (node['ip'], node['device'],
+                   storage_directory(datadir, part, path_hash)))
         for node in handoff_nodes:
             print('ssh %s "ls -lah ${DEVICE:-/srv/node*}/%s/%s" # [Handoff]' %
                   (node['ip'], node['device'],
@@ -187,6 +203,10 @@ def print_ring_locations(ring, datadir, account, container=None, obj=None,
     else:
         for node in primary_nodes:
             print('ssh %s "ls -lah ${DEVICE:-/srv/node*}/%s/%s/%d"' %
+                  (node['ip'], node['device'], datadir, part))
+        for node in last_primary_nodes:
+            print('ssh %s "ls -lah ${DEVICE:-/srv/node*}/%s/%s/%d"'
+                  ' # [Old primary]' %
                   (node['ip'], node['device'], datadir, part))
         for node in handoff_nodes:
             print('ssh %s "ls -lah ${DEVICE:-/srv/node*}/%s/%s/%d"'

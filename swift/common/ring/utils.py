@@ -70,6 +70,12 @@ def resize_array(old_arr, new_dev_id_bytes):
          for dev_id in old_arr))
 
 
+def resize_ringlike(ringlike, new_dev_id_bytes):
+    if ringlike:
+        ringlike = [resize_array(row, new_dev_id_bytes) for row in ringlike]
+    return ringlike
+
+
 @contextlib.contextmanager
 def network_order_array(arr):
     if sys.byteorder == 'little':

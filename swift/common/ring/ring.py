@@ -32,7 +32,7 @@ from swift.common.exceptions import DevIdBytesTooSmall, RingLoadError
 from swift.common.utils import hash_path, validate_configuration, md5
 from swift.common.ring.io import RingReader, RingWriter
 from swift.common.ring.utils import BYTES_TO_TYPE_CODE, calc_dev_id_bytes, \
-    resize_array, tiers_for_dev
+    tiers_for_dev, none_dev_id, resize_ringlike
 
 
 DEFAULT_RELOAD_TIME = 15
@@ -69,7 +69,8 @@ class RingData(object):
     """Partitioned consistent hashing ring data (used for serialization)."""
 
     def __init__(self, replica2part2dev_id, devs, part_shift,
-                 next_part_power=None, version=None):
+                 next_part_power=None, version=None, past2part2index=None,
+                 past2part2dev_id=None, history_count=1):
         self.devs = devs
         for i, part2dev_id in enumerate(replica2part2dev_id):
             if not isinstance(part2dev_id, array.array):
@@ -79,6 +80,9 @@ class RingData(object):
         self.next_part_power = next_part_power
         self.version = version
         self.format_version = None
+        self._past2part2index = past2part2index or []
+        self._past2part2dev_id = past2part2dev_id or []
+        self._history_count = history_count
         self.size = self.raw_size = None
         # Next two are used when replica2part2dev is empty
         self._dev_id_bytes = 0
@@ -134,9 +138,10 @@ class RingData(object):
         # For rings loaded with metadata_only=True
         self._dev_id_bytes = new_dev_id_bytes
 
-        self._replica2part2dev_id = [
-            resize_array(part2dev_id, new_dev_id_bytes)
-            for part2dev_id in self._replica2part2dev_id]
+        self._replica2part2dev_id = resize_ringlike(
+            self._replica2part2dev_id, new_dev_id_bytes)
+        self._past2part2dev_id = resize_ringlike(
+            self._past2part2dev_id, new_dev_id_bytes)
 
     @property
     def max_dev_id(self):
@@ -178,6 +183,9 @@ class RingData(object):
         ring_dict = json.loads(reader.read_blob('!I'))
         ring_dict['replica2part2dev_id'] = []
         ring_dict['dev_id_bytes'] = 2
+        ring_dict['past2part2index'] = []
+        ring_dict['past2part2dev_id'] = []
+        ring_dict['history_count'] = 0
 
         if metadata_only:
             return ring_dict
@@ -219,6 +227,8 @@ class RingData(object):
 
         ring_dict = json.loads(reader.read_section('swift/ring/metadata'))
         ring_dict['replica2part2dev_id'] = []
+        ring_dict['past2part2index'] = []
+        ring_dict['past2part2dev_id'] = []
         ring_dict['devs'] = []
 
         if not metadata_only or include_devices:
@@ -233,6 +243,18 @@ class RingData(object):
         with reader.open_section('swift/ring/assignments') as section:
             ring_dict['replica2part2dev_id'] = section.read_ring_table(
                 ring_dict['dev_id_bytes'], partition_count)
+
+        section_name = 'swift/ring/assignment_history_index'
+        if section_name in reader:
+            with reader.open_section(section_name) as section:
+                ring_dict['past2part2index'] = section.read_ring_table(
+                    2, partition_count)
+
+        section_name = 'swift/ring/assignment_history_dev'
+        if section_name in reader:
+            with reader.open_section(section_name) as section:
+                ring_dict['past2part2dev_id'] = section.read_ring_table(
+                    ring_dict['dev_id_bytes'], partition_count)
 
         return ring_dict
 
@@ -264,7 +286,10 @@ class RingData(object):
         ring = cls(ring_data['replica2part2dev_id'],
                    ring_data['devs'], ring_data['part_shift'],
                    ring_data.get('next_part_power'),
-                   ring_data.get('version'))
+                   ring_data.get('version'),
+                   ring_data.get('past2part2index'),
+                   ring_data.get('past2part2dev_id'),
+                   ring_data.get('history_count', 0))
         # For loading with metadata_only=True
         if 'replica_count' in ring_data:
             ring._replica_count = ring_data['replica_count']
@@ -312,7 +337,8 @@ class RingData(object):
             'part_shift': ring['part_shift'],
             'dev_id_bytes': ring['dev_id_bytes'],
             'replica_count': calc_replica_count(ring['replica2part2dev_id']),
-            'version': ring['version']}
+            'version': ring['version'],
+            'history_count': ring['history_count']}
 
         next_part_power = ring.get('next_part_power')
         if next_part_power is not None:
@@ -326,6 +352,13 @@ class RingData(object):
 
         with writer.section('swift/ring/assignments'):
             writer.write_ring_table(ring['replica2part2dev_id'])
+
+        if ring['past2part2index'] and ring['past2part2dev_id']:
+            # add the past part table(s)
+            with writer.section('swift/ring/assignment_history_index'):
+                writer.write_ring_table(ring['past2part2index'])
+            with writer.section('swift/ring/assignment_history_dev'):
+                writer.write_ring_table(ring['past2part2dev_id'])
 
     def save(self, filename, mtime=1300507380.0,
              format_version=DEFAULT_RING_FORMAT_VERSION):
@@ -350,10 +383,13 @@ class RingData(object):
     def to_dict(self):
         return {'devs': self.devs,
                 'replica2part2dev_id': self._replica2part2dev_id,
+                'past2part2index': self._past2part2index,
+                'past2part2dev_id': self._past2part2dev_id,
                 'part_shift': self._part_shift,
                 'next_part_power': self.next_part_power,
                 'dev_id_bytes': self.dev_id_bytes,
-                'version': self.version}
+                'version': self.version,
+                'history_count': self._history_count}
 
 
 class Ring(object):
@@ -415,6 +451,9 @@ class Ring(object):
 
             self._dev_id_bytes = ring_data._dev_id_bytes
             self._replica2part2dev_id = ring_data._replica2part2dev_id
+            self._past2part2index = ring_data._past2part2index
+            self._past2part2dev_id = ring_data._past2part2dev_id
+            self._history_count = ring_data._history_count
             self._part_shift = ring_data._part_shift
             self._rebuild_tier_data()
             self._update_bookkeeping()
@@ -489,6 +528,14 @@ class Ring(object):
     def raw_size(self):
         return self._raw_size
 
+    @property
+    def history_count(self):
+        return self._history_count
+
+    @property
+    def history(self):
+        return len(self._past2part2index)
+
     def _rebuild_tier_data(self):
         self.tier2devs = defaultdict(list)
         for dev in self._devs:
@@ -545,6 +592,31 @@ class Ring(object):
         :returns: True if the ring on disk has changed, False otherwise
         """
         return getmtime(self.serialized_path) != self._mtime
+
+    def get_last_part_nodes(self, part):
+        """
+        Return an iterator of nodes that were previously primaries for the
+        given part
+
+        :param part: The part to look up
+        :returns: An iterator of zero or more node dicts, each with an
+                  ``index`` key indicating the replica for which they were
+                  responsible
+        """
+        if not (self._past2part2dev_id and self._past2part2dev_id[0] and
+                part < len(self._past2part2dev_id[0])):
+            return
+
+        for part2dev, part2index in zip(self._past2part2dev_id,
+                                        self._past2part2index):
+            dev_id = part2dev[part]
+            if dev_id == none_dev_id(self.dev_id_bytes):
+                continue
+            try:
+                index = part2index[part]
+                yield dict(self.devs[dev_id], index=index)
+            except IndexError:
+                continue
 
     def _get_part_nodes(self, part):
         part_nodes = []
@@ -620,7 +692,7 @@ class Ring(object):
         part = self.get_part(account, container, obj)
         return part, self._get_part_nodes(part)
 
-    def get_more_nodes(self, part):
+    def get_more_nodes(self, part, for_read=False):
         """
         Generator to get extra nodes for a partition for hinted handoff.
 
@@ -630,6 +702,8 @@ class Ring(object):
         ring changes.
 
         :param part: partition to get handoff nodes for
+        :param for_read: if true insert the last primary at the start of
+            the generator, if one exists for the part.
         :returns: generator of node dicts
 
         See :func:`get_nodes` for a description of the node dicts.
@@ -643,6 +717,20 @@ class Ring(object):
         same_zones = set((d['region'], d['zone']) for d in primary_nodes)
         same_ips = set(
             (d['region'], d['zone'], d['ip']) for d in primary_nodes)
+
+        # if for_read is used attempt to first push the last primary, if it
+        # hesn't already be used.
+        if for_read:
+            for last_primary in self.get_last_part_nodes(part):
+                if last_primary['id'] not in used:
+                    # negate the sign and increment the index by 1 so we know
+                    # what index but that it's an old one. This way we can
+                    # determine if it's authoritative or not. I.e
+                    # old index -> becomes
+                    # 0 -> -1; 1 -> -2; 2 -> -3
+                    last_primary['index'] = -1 * (last_primary['index'] + 1)
+                    yield last_primary
+                    used.add(last_primary['id'])
 
         parts = len(self._replica2part2dev_id[0])
         part_hash = md5(str(part).encode('ascii'),

@@ -71,9 +71,15 @@ class TestRingData(unittest.TestCase):
 
         if metadata_only:
             self.assertEqual([], rd_got._replica2part2dev_id)
+            self.assertEqual([], rd_got._past2part2index)
+            self.assertEqual([], rd_got._past2part2dev_id)
         else:
             self.assertEqual(rd_expected._replica2part2dev_id,
                              rd_got._replica2part2dev_id)
+            self.assertEqual(rd_expected._past2part2index,
+                             rd_got._past2part2index)
+            self.assertEqual(rd_expected._past2part2dev_id,
+                             rd_got._past2part2dev_id)
 
     def test_attrs(self):
         r2p2d = [[0, 1, 0, 1], [0, 1, 0, 1]]
@@ -363,10 +369,13 @@ class TestRingData(unittest.TestCase):
                 {'id': 1, 'zone': 1, 'ip': '10.1.1.1',
                  'port': 7000, 'region': 1}],
             'replica2part2dev_id': expected_r2p2d,
+            'past2part2index': [],
+            'past2part2dev_id': [],
             'part_shift': 30,
             'next_part_power': None,
             'dev_id_bytes': 1,
-            'version': None}
+            'version': None,
+            'history_count': 1}
 
         # version 0
         loaded_rd = ring.RingData.load(ring_fname_pickle)
@@ -382,6 +391,7 @@ class TestRingData(unittest.TestCase):
         # version 1
         expected_rd_dict['dev_id_bytes'] = 2
         expected_rd_dict['replica2part2dev_id'] = expected_r2p2d
+        expected_rd_dict['history_count'] = 0
         loaded_rd = ring.RingData.load(ring_fname_1)
         self.assertEqual(loaded_rd.to_dict(), expected_rd_dict)
         loaded_rd = ring.RingData.load(ring_fname_1, metadata_only=True)
@@ -421,6 +431,11 @@ class TestRing(TestRingBase):
             array.array('H', [0, 1, 0, 1]),
             array.array('H', [0, 1, 0, 1]),
             array.array('H', [3, 4, 3, 4])]
+        none_dev = ring_utils.none_dev_id(2)
+        self.intended_past2part2index = [
+            array.array('H', [none_dev, none_dev, 1, 0])]
+        self.intended_past2part2dev_id = [
+            array.array('H', [none_dev, none_dev, 3, 4])]
         self.intended_devs = [{'id': 0, 'region': 0, 'zone': 0, 'weight': 1.0,
                                'ip': '10.1.1.1', 'port': 6200,
                                'replication_ip': '10.1.0.1',
@@ -442,7 +457,9 @@ class TestRing(TestRingBase):
         self.intended_reload_time = 15
         rd = ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift)
+            self.intended_devs, self.intended_part_shift,
+            past2part2index=self.intended_past2part2index,
+            past2part2dev_id=self.intended_past2part2dev_id)
         rd.save(self.testgz, format_version=self.FORMAT_VERSION)
         self.ring = ring.Ring(
             self.testdir,
@@ -656,6 +673,11 @@ class TestRing(TestRingBase):
     def test_get_part_nodes(self):
         part, nodes = self.ring.get_nodes('a')
         self.assertEqual(nodes, self.ring.get_part_nodes(part))
+
+    def test_get_last_part_nodes(self):
+        # Ring v1 can't safely serialize last-primaries
+        self.assertEqual([[]] * 6, [
+            list(self.ring.get_last_part_nodes(part)) for part in range(6)])
 
     def test_get_nodes(self):
         # Yes, these tests are deliberately very fragile. We want to make sure
@@ -1358,9 +1380,29 @@ class TestRingV2(TestRing):
             self.assertEqual(str(err.exception),
                              'Too many devices for 2-byte device ids')
 
+    def test_get_last_part_nodes(self):
+        expected_last_part_nodes = [[], [], [(3, 1)], [(4, 0)], [], []]
+        last_part_nodes = [list(self.ring.get_last_part_nodes(part))
+                           for part in range(6)]
+        last_part_nodes = [
+            [(item['id'], item['index']) if item else None
+             for item in last_nodes]
+            for last_nodes in last_part_nodes]
+        self.assertEqual(last_part_nodes, expected_last_part_nodes)
+
 
 class TestRingV0(TestRing):
     FORMAT_VERSION = 0
+
+    def test_get_last_part_nodes(self):
+        expected_last_part_nodes = [[], [], [(3, 1)], [(4, 0)], [], []]
+        last_part_nodes = [list(self.ring.get_last_part_nodes(part))
+                           for part in range(6)]
+        last_part_nodes = [
+            [(item['id'], item['index']) if item else None
+             for item in last_nodes]
+            for last_nodes in last_part_nodes]
+        self.assertEqual(last_part_nodes, expected_last_part_nodes)
 
 
 class ExtendedRing(ring.RingData):

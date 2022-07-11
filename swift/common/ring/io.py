@@ -579,8 +579,10 @@ class RingWriter(object):
     def write_ring_table(self, table):
         """
         Write a length-value encoded replica2part2dev table, or similar.
+
         Should *not* be used for v1 rings, as there's always a ``!Q`` size
         prefix, and values are written in network order.
+
         :param table: list of arrays
         """
         dev_id_bytes = table[0].itemsize if table else 0
