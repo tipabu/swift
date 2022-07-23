@@ -17,7 +17,7 @@ import json
 from time import time
 
 from swift.common.utils import public, streq_const_time
-from swift.common.digest import get_hmac
+from swift.common.digest import get_hmac, extract_digest_and_algorithm
 from swift.common.registry import get_swift_info
 from swift.proxy.controllers.base import Controller, delay_denial
 from swift.common.swob import HTTPOk, HTTPForbidden, HTTPUnauthorized
@@ -78,12 +78,20 @@ class InfoController(Controller):
             if expires < time():
                 return HTTPUnauthorized(request=req)
 
+            try:
+                hash_name, sig = extract_digest_and_algorithm(sig)
+            except ValueError:
+                return HTTPUnauthorized(request=req)
+            if hash_name not in self.app.allowed_digests:
+                return HTTPUnauthorized(request=req)
+
             valid_sigs = []
             for method in self.allowed_hmac_methods[req.method]:
                 valid_sigs.append(get_hmac(method,
                                            '/info',
                                            expires,
-                                           self.admin_key))
+                                           self.admin_key,
+                                           hash_name))
 
             # While it's true that any() will short-circuit, this doesn't
             # affect the timing-attack resistance since the only way this will
@@ -92,6 +100,7 @@ class InfoController(Controller):
                                 for valid_sig in valid_sigs)
             if not is_valid_hmac:
                 return HTTPUnauthorized(request=req)
+            self.app.logger.increment('info.digests.%s' % hash_name)
 
         headers = {}
         if 'Origin' in req.headers:

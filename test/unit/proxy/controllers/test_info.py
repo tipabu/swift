@@ -36,6 +36,7 @@ class TestInfoController(unittest.TestCase):
         disallowed_sections = disallowed_sections or []
 
         app = Mock(spec=ProxyApp, logger=debug_logger())
+        app.allowed_digests = digest.DEFAULT_ALLOWED_DIGESTS.split()
         return InfoController(app, None, expose_info,
                               disallowed_sections, admin_key)
 
@@ -58,6 +59,23 @@ class TestInfoController(unittest.TestCase):
         registry._swift_info = {'foo': {'bar': 'baz'}}
         registry._swift_admin_info = {'qux': {'quux': 'corge'}}
 
+        req = Request.blank(
+            '/info', environ={'REQUEST_METHOD': 'GET'})
+        resp = controller.GET(req)
+        self.assertIsInstance(resp, HTTPException)
+        self.assertEqual('200 OK', str(resp))
+        info = json.loads(resp.body)
+        self.assertNotIn('admin', info)
+        self.assertIn('foo', info)
+        self.assertIn('bar', info['foo'])
+        self.assertEqual(info['foo']['bar'], 'baz')
+
+    def test_get_info_non_admin(self):
+        controller = self.get_controller(expose_info=True, admin_key='secret')
+        registry._swift_info = {'foo': {'bar': 'baz'}}
+        registry._swift_admin_info = {'qux': {'quux': 'corge'}}
+
+        # admin key is set, but request is not signed
         req = Request.blank(
             '/info', environ={'REQUEST_METHOD': 'GET'})
         resp = controller.GET(req)
@@ -143,25 +161,47 @@ class TestInfoController(unittest.TestCase):
         self.assertEqual('403 Forbidden', str(resp))
 
     def test_get_admin_info(self):
-        controller = self.get_controller(expose_info=True,
-                                         admin_key='secret-admin-key')
-        registry._swift_info = {'foo': {'bar': 'baz'}}
-        registry._swift_admin_info = {'qux': {'quux': 'corge'}}
+        for digest_algo in ('sha1', 'sha256', 'sha512'):
+            controller = self.get_controller(expose_info=True,
+                                             admin_key='secret-admin-key')
+            registry._swift_info = {'foo': {'bar': 'baz'}}
+            registry._swift_admin_info = {'qux': {'quux': 'corge'}}
 
-        expires = int(time.time() + 86400)
-        sig = digest.get_hmac('GET', '/info', expires, 'secret-admin-key')
-        path = '/info?swiftinfo_sig={sig}&swiftinfo_expires={expires}'.format(
-            sig=sig, expires=expires)
-        req = Request.blank(
-            path, environ={'REQUEST_METHOD': 'GET'})
-        resp = controller.GET(req)
-        self.assertIsInstance(resp, HTTPException)
-        self.assertEqual('200 OK', str(resp))
-        info = json.loads(resp.body)
-        self.assertIn('admin', info)
-        self.assertIn('qux', info['admin'])
-        self.assertIn('quux', info['admin']['qux'])
-        self.assertEqual(info['admin']['qux']['quux'], 'corge')
+            expires = int(time.time() + 86400)
+            sig = digest.get_hmac('GET', '/info', expires, 'secret-admin-key',
+                                  digest=digest_algo)
+            path = ('/info?swiftinfo_sig={sig}&swiftinfo_expires'
+                    '={expires}'.format(sig=sig, expires=expires))
+            req = Request.blank(
+                path, environ={'REQUEST_METHOD': 'GET'})
+            resp = controller.GET(req)
+            self.assertIsInstance(resp, HTTPException)
+            self.assertEqual('200 OK', str(resp))
+            info = json.loads(resp.body)
+            self.assertIn('admin', info)
+            self.assertIn('qux', info['admin'])
+            self.assertIn('quux', info['admin']['qux'])
+            self.assertEqual(info['admin']['qux']['quux'], 'corge')
+
+    def test_get_admin_info_bad_algo(self):
+        for digest_algo in ('sha1', 'sha256', 'sha512'):
+            controller = self.get_controller(expose_info=True,
+                                             admin_key='secret-admin-key')
+            controller.app.allowed_digests = ['none']
+            registry._swift_info = {'foo': {'bar': 'baz'}}
+            registry._swift_admin_info = {'qux': {'quux': 'corge'}}
+
+            expires = int(time.time() + 86400)
+            sig = digest.get_hmac('GET', '/info', expires, 'secret-admin-key',
+                                  digest=digest_algo)
+            path = ('/info?swiftinfo_sig={sig}&swiftinfo_expires'
+                    '={expires}'.format(sig=sig, expires=expires))
+            req = Request.blank(
+                path, environ={'REQUEST_METHOD': 'GET'})
+            resp = controller.GET(req)
+            self.assertIsInstance(resp, HTTPException)
+            self.assertEqual('401 Unauthorized', str(resp))
+            self.assertEqual(b'', resp.body)
 
     def test_head_admin_info(self):
         controller = self.get_controller(expose_info=True,

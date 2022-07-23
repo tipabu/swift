@@ -14,6 +14,11 @@ bind_port = 8080
 # which will disable admin calls to /info.
 # admin_key = secret_admin_key
 #
+# The digest algorithm(s) supported for generating admin /info signatures;
+# whitespace-delimited.  Note that sha1 is deprecated and may be
+# removed in a future release.
+# allowed_digests = sha1 sha256 sha512
+#
 # Allows the ability to withhold sections from showing up in the public calls
 # to /info.  You can withhold subsections by separating the dict level with a
 # ".". Default value is 'swift.valid_api_versions, swift.auto_create_account_prefix'
@@ -939,12 +944,17 @@ use = egg:swift#tempurl
 # outgoing_allow_headers = x-object-meta-public-*
 #
 # The digest algorithm(s) supported for generating signatures;
-# whitespace-delimited.
+# whitespace-delimited.  Note that sha1 is deprecated and may be
+# removed in a future release.
 # allowed_digests = sha1 sha256 sha512
 
 # Note: Put formpost just before your auth filter(s) in the pipeline
 [filter:formpost]
 use = egg:swift#formpost
+# The digest algorithm(s) supported for generating signatures;
+# whitespace-delimited.  Note that sha1 is deprecated and may be
+# removed in a future release.
+# allowed_digests = sha1 sha256 sha512
 
 # Note: Just needs to be placed before the proxy-server in the pipeline.
 [filter:name_check]

@@ -28,6 +28,7 @@ from eventlet import Timeout
 
 from swift import __canonical_version__ as swift_version
 from swift.common import constraints
+from swift.common.digest import get_allowed_digests
 from swift.common.http import is_server_error
 from swift.common.storage_policy import POLICIES
 from swift.common.ring import Ring
@@ -347,17 +348,27 @@ class Application(object):
                 'swift.valid_api_versions',
             ])))
         self.admin_key = conf.get('admin_key', None)
+        if self.admin_key:
+            self.allowed_digests, deprecated_digests = get_allowed_digests(
+                conf.get('allowed_digests', '').split(), self.logger)
+        else:
+            self.allowed_digests = deprecated_digests = []
         self._override_options = self._load_per_policy_config(conf)
         self.sorts_by_timing = any(pc.sorting_method == 'timing'
                                    for pc in self._override_options.values())
-
-        register_swift_info(
+        info_dict = dict(
             version=swift_version,
             strict_cors_mode=self.strict_cors_mode,
             policies=POLICIES.get_policy_info(),
             allow_account_management=self.allow_account_management,
             account_autocreate=self.account_autocreate,
             **constraints.EFFECTIVE_CONSTRAINTS)
+        if self.admin_key:
+            info_dict['info_allowed_digests'] = sorted(self.allowed_digests)
+            if deprecated_digests:
+                info_dict['info_deprecated_digests'] = sorted(
+                    deprecated_digests)
+        register_swift_info(**info_dict)
         self.watchdog = Watchdog()
         self.watchdog.spawn()
 

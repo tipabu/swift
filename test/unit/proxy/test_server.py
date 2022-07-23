@@ -1135,7 +1135,9 @@ class TestProxyServer(unittest.TestCase):
                 self.assertEqual(resp.body, b'Response from 127.0.0.2')
 
     def test_info_defaults(self):
+        logger = debug_logger('test')
         app = proxy_server.Application({},
+                                       logger=logger,
                                        account_ring=FakeRing(),
                                        container_ring=FakeRing())
 
@@ -1147,6 +1149,44 @@ class TestProxyServer(unittest.TestCase):
             'swift.valid_api_versions',
         ], sorted(app.disallowed_sections))
         self.assertIsNone(app.admin_key)
+        self.assertEqual([], app.allowed_digests)
+        self.assertEqual(logger.get_lines_for_level('warning'), [])
+
+    def test_info_config(self):
+        logger = debug_logger('test')
+        app = proxy_server.Application({'admin_key': 'secret'},
+                                       logger=logger,
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing())
+
+        self.assertEqual('secret', app.admin_key)
+        self.assertEqual({'sha1', 'sha256', 'sha512'}, app.allowed_digests)
+        self.assertEqual(logger.get_lines_for_level('warning'), [
+            'The following digest algorithms are allowed by default but '
+            'deprecated: sha1. Support will be disabled by default in a '
+            'future release, and later removed entirely.',
+        ])
+
+        logger.clear()
+        app = proxy_server.Application(
+            {'admin_key': 'secret', 'allowed_digests': 'sha1'},
+            logger=logger,
+            account_ring=FakeRing(),
+            container_ring=FakeRing())
+        self.assertEqual({'sha1'}, app.allowed_digests)
+        self.assertEqual(logger.get_lines_for_level('warning'), [
+            'The following digest algorithms are configured but '
+            'deprecated: sha1. Support will be removed in a future release.',
+        ])
+
+        logger.clear()
+        app = proxy_server.Application(
+            {'admin_key': 'secret', 'allowed_digests': 'sha256'},
+            logger=logger,
+            account_ring=FakeRing(),
+            container_ring=FakeRing())
+        self.assertEqual({'sha256'}, app.allowed_digests)
+        self.assertEqual(logger.get_lines_for_level('warning'), [])
 
     def test_get_info_controller(self):
         req = Request.blank('/info')
@@ -11428,7 +11468,7 @@ class TestSwiftInfo(unittest.TestCase):
         self.assertEqual(len(si), 17)
 
         si = registry.get_swift_info()['swift']
-        # Tehse settings is by default excluded by disallowed_sections
+        # These settings are by default excluded by disallowed_sections
         self.assertEqual(si['valid_api_versions'],
                          constraints.VALID_API_VERSIONS)
         self.assertEqual(si['auto_create_account_prefix'],
@@ -11442,6 +11482,33 @@ class TestSwiftInfo(unittest.TestCase):
         self.assertEqual(sorted_pols[0]['name'], 'bert')
         self.assertEqual(sorted_pols[1]['name'], 'ernie')
         self.assertEqual(sorted_pols[2]['name'], 'migrated')
+
+        # no admin key set, so nothing about allowed digests
+        self.assertNotIn('info_allowed_digests', si)
+        self.assertNotIn('info_deprecated_digests', si)
+
+    def test_registered_default_digests(self):
+        app = proxy_server.Application({'admin_key': 'secret'},
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing())
+        req = Request.blank('/info')
+        resp = req.get_response(app)
+        si = json.loads(resp.body)['swift']
+        self.assertEqual(si['info_allowed_digests'],
+                         ['sha1', 'sha256', 'sha512'])
+        self.assertEqual(si['info_deprecated_digests'], ['sha1'])
+
+    def test_registered_non_default_digests(self):
+        app = proxy_server.Application({'admin_key': 'secret',
+                                        'allowed_digests': 'sha512'},
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing())
+        req = Request.blank('/info')
+        resp = req.get_response(app)
+        si = json.loads(resp.body)['swift']
+        self.assertEqual(si['info_allowed_digests'], ['sha512'])
+        # nothing deprecated, so don't even expose it
+        self.assertNotIn('info_deprecated_digests', si)
 
 
 class TestSocketObjectVersions(unittest.TestCase):
