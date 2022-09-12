@@ -1621,7 +1621,7 @@ class NodeIter(object):
     """
 
     def __init__(self, app, ring, partition, logger, node_iter=None,
-                 policy=None):
+                 policy=None, for_read=False):
         self.app = app
         self.ring = ring
         self.partition = partition
@@ -1630,7 +1630,7 @@ class NodeIter(object):
         part_nodes = ring.get_part_nodes(partition)
         if node_iter is None:
             node_iter = itertools.chain(
-                part_nodes, ring.get_more_nodes(partition))
+                part_nodes, ring.get_more_nodes(partition, for_read=for_read))
         self.num_primary_nodes = len(part_nodes)
         self.nodes_left = self.app.request_node_count(self.num_primary_nodes)
         self.expected_handoffs = self.nodes_left - self.num_primary_nodes
@@ -1959,7 +1959,10 @@ class Controller(object):
         :returns: a swob.Response object
         """
         nodes = GreenthreadSafeIterator(
-            node_iterator or self.app.iter_nodes(ring, part, self.logger)
+            node_iterator or self.app.iter_nodes(
+                ring, part, self.logger,
+                for_read=req.method in ('GET', 'HEAD'),
+            )
         )
         node_number = node_count or len(ring.get_part_nodes(part))
         pile = GreenAsyncPile(node_number)

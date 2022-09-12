@@ -290,13 +290,14 @@ class FakeRing(Ring):
     def _get_part_nodes(self, part):
         return [dict(node, index=i) for i, node in enumerate(list(self._devs))]
 
-    def get_more_nodes(self, part):
+    def get_more_nodes(self, part, for_read=False):
         index_counter = itertools.count()
         for x in range(self.replicas, (self.replicas + self.max_more_nodes)):
-            ip = '10.0.0.%s' % x
+            ip_prefix = '10.1.' if for_read else '10.0.'
+            ip = ip_prefix + '0.%s' % x
             port = self._base_port + x
             if self.separate_replication:
-                repl_ip = '10.0.1.%s' % x
+                repl_ip = ip_prefix + '1.%s' % x
                 repl_port = port + 100
             else:
                 repl_ip, repl_port = ip, port
@@ -1221,7 +1222,8 @@ def fake_ec_node_response(node_frags, policy):
     def _build_node_map(req, policy):
         part = utils.split_path(req['path'], 5, 5, True)[1]
         all_nodes.extend(policy.object_ring.get_part_nodes(part))
-        all_nodes.extend(policy.object_ring.get_more_nodes(part))
+        all_nodes.extend(policy.object_ring.get_more_nodes(
+            part, for_read=True))
         for i, node in enumerate(all_nodes):
             node_map[(node['ip'], node['port'])] = i
             call_count[i] = 0

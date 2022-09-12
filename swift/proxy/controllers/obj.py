@@ -251,7 +251,7 @@ class BaseObjectController(Controller):
         partition = obj_ring.get_part(
             self.account_name, self.container_name, self.object_name)
         node_iter = self.app.iter_nodes(obj_ring, partition, self.logger,
-                                        policy=policy)
+                                        policy=policy, for_read=True)
 
         resp = self._get_or_head_response(req, node_iter, partition, policy)
 

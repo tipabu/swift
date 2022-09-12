@@ -688,9 +688,10 @@ class Application(object):
         self.logger.error('%(msg)s %(node)s',
                           {'msg': msg, 'node': node_to_string(node)})
 
-    def iter_nodes(self, ring, partition, logger, node_iter=None, policy=None):
+    def iter_nodes(self, ring, partition, logger, node_iter=None, policy=None,
+                   for_read=False):
         return NodeIter(self, ring, partition, logger, node_iter=node_iter,
-                        policy=policy)
+                        policy=policy, for_read=for_read)
 
     def exception_occurred(self, node, typ, additional_info,
                            **kwargs):
