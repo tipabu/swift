@@ -57,7 +57,8 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPClientDisconnect, HTTPMethodNotAllowed, Request, Response, \
     HTTPInsufficientStorage, HTTPForbidden, HTTPException, HTTPConflict, \
     HTTPServerError, wsgi_to_bytes, wsgi_to_str, normalize_etag
-from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
+from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter, \
+    get_part_path
 from swift.obj.expirer import build_task_obj
 
 
@@ -1285,8 +1286,17 @@ class ObjectController(BaseStorageServer):
     @timing_stats(sample_rate=0.1)
     def REPLICATE(self, request):
         """
-        Handle REPLICATE requests for the Swift Object Server.  This is used
-        by the object replicator to get hashes for directories.
+        Handle REPLICATE requests for the Swift Object Server.
+
+        This is used by the object replicator and reconstructor to retrieve
+        and update suffix hashes for partitions. There are three modes:
+
+        - ``REPLICATE /<dev>/<part>`` consolidates hashes, rehashes any
+          invalid suffixes, and returns the result.
+        - ``REPLICATE /<dev>/<part>/<suffix>[-<suffix>][...]`` invalidates the
+          provided suffixes. No hashes are read or returned.
+        - ``REPLICATE /<dev>/<part>/hashes`` consolidates hashes and returns
+          the result *without* rehashing.
 
         Note that the name REPLICATE is preserved for historical reasons as
         this verb really just returns the hashes information for the specified
@@ -1294,16 +1304,26 @@ class ObjectController(BaseStorageServer):
         """
         device, partition, suffix_parts, policy = \
             get_name_and_placement(request, 2, 3, True)
-        suffixes = suffix_parts.split('-') if suffix_parts else []
-        try:
-            hashes = self._diskfile_router[policy].get_hashes(
-                device, partition, suffixes, policy,
-                skip_rehash=bool(suffixes))
-        except DiskFileDeviceUnavailable:
-            resp = HTTPInsufficientStorage(drive=device, request=request)
+        mgr = self._diskfile_router[policy]
+        if suffix_parts == 'hashes':
+            dev_path = mgr.get_dev_path(device)
+            if not dev_path:
+                resp = HTTPInsufficientStorage(drive=device, request=request)
+            else:
+                partition_path = get_part_path(dev_path, policy, partition)
+                hashes = mgr.consolidate_hashes(partition_path)
+                resp = Response(body=pickle.dumps(hashes, protocol=2))
         else:
-            # force pickle protocol for compatibility with py2 nodes
-            resp = Response(body=pickle.dumps(hashes, protocol=2))
+            suffixes = suffix_parts.split('-') if suffix_parts else []
+            try:
+                hashes = mgr.get_hashes(
+                    device, partition, suffixes, policy,
+                    skip_rehash=bool(suffixes))
+            except DiskFileDeviceUnavailable:
+                resp = HTTPInsufficientStorage(drive=device, request=request)
+            else:
+                # force pickle protocol for compatibility with py2 nodes
+                resp = Response(body=pickle.dumps(hashes, protocol=2))
         return resp
 
     @public
