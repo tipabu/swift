@@ -14,8 +14,8 @@
 # limitations under the License.
 
 from collections import defaultdict
-import os
 import errno
+import os
 from os.path import isdir, isfile, join, dirname
 import random
 import shutil
@@ -41,8 +41,8 @@ from swift.common.daemon import Daemon
 from swift.common.http import HTTP_OK, HTTP_INSUFFICIENT_STORAGE
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.obj import ssync_sender
-from swift.obj.diskfile import get_data_dir, get_tmp_dir, DiskFileRouter, \
-    invalidate_hash
+from swift.obj.diskfile import get_data_dir, get_part_path, get_tmp_dir, \
+    DiskFileRouter, invalidate_hash
 from swift.common.storage_policy import POLICIES, REPL_POLICY
 from swift.common.exceptions import PartitionLockTimeout
 
@@ -662,6 +662,38 @@ class ObjectReplicator(Daemon):
                         suffix_dir)
         return success_paths, error_paths
 
+    def get_remote_hashes(self, node, policy_index, partition, rehash=True):
+        node_str = node_to_string(node, replication=True)
+        headers = dict(self.default_headers)
+        headers['X-Backend-Storage-Policy-Index'] = policy_index
+        resp = None
+        status = None
+        remote_hash = {}
+        try:
+            with Timeout(self.http_timeout):
+                resp = http_connect(
+                    node['replication_ip'], node['replication_port'],
+                    node['device'], partition, 'REPLICATE',
+                    '' if rehash else '/hashes', headers=headers).getresponse()
+                status = resp.status
+                if resp.status == HTTP_OK:
+                    remote_hash = pickle.loads(resp.read())
+                elif resp.status == HTTP_INSUFFICIENT_STORAGE:
+                    self.logger.error('%s responded as unmounted', node_str)
+                    # Note that caller is expected to see the 507 and know to
+                    # over-replicate to a handoff
+                else:
+                    self.logger.error(
+                        "Invalid response %(resp)s from %(remote)s",
+                        {'resp': resp.status,
+                         'remote': node_str})
+        except (Exception, Timeout):
+            self.logger.exception("Error syncing with node: %s", node_str)
+        finally:
+            del resp
+
+        return status, remote_hash
+
     def update(self, job):
         """
         High-level method that replicates a single partition.
@@ -678,14 +710,19 @@ class ObjectReplicator(Daemon):
         begin = time.time()
         df_mgr = self._df_router[job['policy']]
         try:
-            hashed, local_hash = tpool.execute(
-                df_mgr._get_hashes, job['device'],
-                job['partition'], job['policy'],
-                do_listdir=_do_listdir(
-                    int(job['partition']),
-                    self.replication_cycle))
-            stats.suffix_hash += hashed
-            self.logger.update_stats('suffix.hashes', hashed)
+            # Consolidate hashes -- don't actually rehash until we know we're
+            # not a new primary being filled, though
+            partition_path = get_part_path(
+                df_mgr.get_dev_path(job['device']),
+                job['policy'],
+                job['partition'],
+            )
+            local_hash = tpool.execute(
+                df_mgr.consolidate_hashes, partition_path)
+
+            # Fan out REPLICATEs to neighbors
+            id_to_node = {}
+            remote_hashes = {}
             attempts_left = len(job['nodes'])
             synced_remote_regions = set()
             random.shuffle(job['nodes'])
@@ -694,75 +731,140 @@ class ObjectReplicator(Daemon):
                 job['policy'].object_ring.get_more_nodes(
                     int(job['partition'])))
             while attempts_left > 0:
-                # If this throws StopIteration it will be caught way below
-                node = next(nodes)
-                node_str = node_to_string(node, replication=True)
-                target_devs_info.add((node['replication_ip'], node['device']))
                 attempts_left -= 1
+                try:
+                    node = next(nodes)
+                except StopIteration:
+                    self.logger.error('Ran out of handoffs while replicating '
+                                      'partition %s of policy %d',
+                                      job['partition'], int(job['policy']))
+                    break
+                status, hashes = self.get_remote_hashes(
+                    node,
+                    int(job['policy']),
+                    int(job['partition']),
+                    rehash=False,
+                )
+                if status == HTTP_OK:
+                    id_to_node[node['id']] = node
+                    remote_hashes[node['id']] = hashes
+                else:
+                    failure_devs_info.add((node['replication_ip'],
+                                           node['device']))
+                    if status == HTTP_INSUFFICIENT_STORAGE:
+                        # XXX: Should there be some limit to how deep into
+                        # handoffs we're willing to go?
+                        attempts_left += 1
+                    # else, error -- maybe it'll resolve for the next cycle?
+
+            # Note that some of the suffix hashes gathered at this point may be
+            # None, because they were invalidated -- the significant thing in
+            # this preflight check is that a node knows about a suffix at all
+
+            def is_handoff(suffixes, total):
+                if suffixes < 10:
+                    # Small enough that we should err on the side of syncing
+                    return False
+                return (suffixes / total) < self.sync_threshold_ratio
+
+            if remote_hashes:
+                remote_suffixes = max(len(h) for h in remote_hashes.values())
+            else:
+                remote_suffixes = 0
+            if is_handoff(len(local_hash), remote_suffixes):
+                # Wait to be filled -- otherwise we're likely to
+                #   - waste iops rehashing locally
+                #   - remove local empty dirs created by an in-progress rsync,
+                #     causing a remote rsync failure
+                #   - invalidate remote suffixes based on local partial state
+                stats.update_deferred += 1
+                return
+
+            # Now we can rehash locally
+            hashed, local_hash = tpool.execute(
+                df_mgr._get_hashes, job['device'],
+                job['partition'], job['policy'],
+                do_listdir=_do_listdir(
+                    int(job['partition']),
+                    self.replication_cycle))
+            stats.suffix_hash += hashed
+            self.logger.update_stats('suffix.hashes', hashed)
+            total_suffixes = max(remote_suffixes, len(local_hash))
+
+            old_hashes = {}
+            if any(is_handoff(len(h), max(remote_suffixes, len(local_hash)))
+                   for h in remote_hashes.values()):
+                # Talk to old primaries, merge whatever they're trying to sync
+                for node in job['last_nodes']:
+                    if node['id'] in remote_hashes:
+                        # Doesn't count if we were going to try to replicate
+                        # to it anyway. Most likely, some disks were unmounted
+                        # and this is a tiny cluster.
+                        continue
+                    status, hashes = self.get_remote_hashes(
+                        node,
+                        int(job['policy']),
+                        int(job['partition']),
+                        rehash=False,
+                    )
+                    if status != HTTP_OK:
+                        failure_devs_info.add((node['replication_ip'],
+                                               node['device']))
+                        continue
+                    for suffix, hsh in hashes.items():
+                        if suffix not in old_hashes:
+                            old_hashes[suffix] = hsh
+                        elif old_hashes[suffix] != hsh:
+                            # Old primaries are out-of-sync, treat as invalid
+                            old_hashes[suffix] = None
+
+            for node_id, remote_hash in remote_hashes.items():
+                node = id_to_node[node_id]
+                target_devs_info.add((node['replication_ip'], node['device']))
                 # if we have already synced to this remote region,
                 # don't sync again on this replication pass
                 if node['region'] in synced_remote_regions:
                     continue
-                try:
-                    with Timeout(self.http_timeout):
-                        resp = http_connect(
-                            node['replication_ip'], node['replication_port'],
-                            node['device'], job['partition'], 'REPLICATE',
-                            '', headers=headers).getresponse()
-                        if resp.status == HTTP_INSUFFICIENT_STORAGE:
-                            self.logger.error('%s responded as unmounted',
-                                              node_str)
-                            attempts_left += 1
+                if is_handoff(len(remote_hash), total_suffixes):
+                    # can sync whatever's not on the old primaries
+                    suffixes = [suffix for suffix, hsh in local_hash.items()
+                                if remote_hash.get(suffix, -1) != hsh
+                                and suffix not in old_hashes]
+                else:
+                    if any(hsh is None for hsh in remote_hash.values()):
+                        # Try to rehash the remote
+                        status, hashes = self.get_remote_hashes(
+                            node,
+                            int(job['policy']),
+                            int(job['partition']),
+                            rehash=True,
+                        )
+                        if status == HTTP_OK:
+                            remote_hash = hashes
+                        else:
                             failure_devs_info.add((node['replication_ip'],
                                                    node['device']))
-                            continue
-                        if resp.status != HTTP_OK:
-                            self.logger.error(
-                                "Invalid response %(resp)s from %(remote)s",
-                                {'resp': resp.status, 'remote': node_str})
-                            failure_devs_info.add((node['replication_ip'],
-                                                   node['device']))
-                            continue
-                        remote_hash = pickle.loads(resp.read())
-                        del resp
-                    suffixes = [suffix for suffix in local_hash if
-                                local_hash[suffix] !=
-                                remote_hash.get(suffix, -1)]
-                    if not suffixes:
-                        stats.hashmatch += 1
-                        continue
-                    hashed, recalc_hash = tpool.execute(
-                        df_mgr._get_hashes,
-                        job['device'], job['partition'], job['policy'],
-                        recalculate=suffixes)
-                    self.logger.update_stats('suffix.hashes', hashed)
-                    local_hash = recalc_hash
-                    suffixes = [suffix for suffix in local_hash if
-                                local_hash[suffix] !=
-                                remote_hash.get(suffix, -1)]
-                    if not suffixes:
-                        stats.hashmatch += 1
-                        continue
-                    stats.rsync += 1
-                    success, _junk = self.sync(node, job, suffixes)
-                    if not success:
-                        failure_devs_info.add((node['replication_ip'],
-                                               node['device']))
-                    # add only remote region when replicate succeeded
-                    if success and node['region'] != job['region']:
-                        synced_remote_regions.add(node['region'])
-                    stats.suffix_sync += len(suffixes)
-                    self.logger.update_stats('suffix.syncs', len(suffixes))
-                except (Exception, Timeout):
+                            # can still use what we've got, anyway
+                    suffixes = [suffix for suffix, hsh in local_hash.items()
+                                if remote_hash.get(suffix, -1) != hsh]
+                                #and remote_hash.get(suffix, -1) is not None]
+                if not suffixes:
+                    # XXX: might want to differentiate between handoff and
+                    #      "normal" hash-matches
+                    stats.hashmatch += 1
+                    continue
+                # TODO: should we do a local rehash of suffixes, like current master?
+                stats.rsync += 1
+                success, _junk = self.sync(node, job, suffixes)
+                if not success:
                     failure_devs_info.add((node['replication_ip'],
                                            node['device']))
-                    self.logger.exception("Error syncing with node: %s",
-                                          node_str)
+                # add only remote region when replicate succeeded
+                if success and node['region'] != job['region']:
+                    synced_remote_regions.add(node['region'])
+                stats.suffix_sync += len(suffixes)
+                self.logger.update_stats('suffix.syncs', len(suffixes))
             stats.suffix_count += len(local_hash)
-        except StopIteration:
-            self.logger.error('Ran out of handoffs while replicating '
-                              'partition %s of policy %d',
-                              job['partition'], int(job['policy']))
         except (Exception, Timeout):
             failure_devs_info.update(target_devs_info)
             self.logger.exception("Error syncing partition")
@@ -883,16 +985,19 @@ class ObjectReplicator(Daemon):
 
                 part_nodes = None
                 try:
+                    part = int(partition)
                     job_path = join(obj_path, partition)
-                    part_nodes = policy.object_ring.get_part_nodes(
-                        int(partition))
+                    part_nodes = policy.object_ring.get_part_nodes(part)
                     nodes = [node for node in part_nodes
                              if node['id'] != local_dev['id']]
+                    last_nodes = list(
+                        policy.object_ring.get_last_part_nodes(part))
                     jobs.append(
                         dict(path=job_path,
                              device=local_dev['device'],
                              obj_path=obj_path,
                              nodes=nodes,
+                             last_nodes=last_nodes,
                              delete=len(nodes) > len(part_nodes) - 1,
                              policy=policy,
                              partition=partition,
