@@ -330,6 +330,8 @@ use = egg:swift#backend_ratelimit
 # 0 means to log the entire line
 # rsync_error_log_line_length = 0
 #
+# sync_threshold_ratio = 0.9
+#
 # handoffs_first and handoff_delete are options for a special case
 # such as disk full in the cluster. These two options SHOULD NOT BE
 # CHANGED, except for such an extreme situations. (e.g. disks filled up

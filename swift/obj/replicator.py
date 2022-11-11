@@ -189,6 +189,7 @@ class ObjectReplicator(Daemon):
             conf.get('log_rsync_transfers', True))
         self.rsync_error_log_line_length = \
             int(conf.get('rsync_error_log_line_length', 0))
+        self.sync_threshold_ratio = float(conf.get('sync_threshold_ratio', 0.9))
         self.handoffs_first = config_true_value(conf.get('handoffs_first',
                                                          False))
         self.handoff_delete = config_auto_int_value(
