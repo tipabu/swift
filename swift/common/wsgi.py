@@ -30,9 +30,9 @@ import warnings
 
 import eventlet
 import eventlet.debug
-from eventlet import greenio, GreenPool, sleep, wsgi, listen, Timeout
+from eventlet import greenio, GreenPool, sleep, wsgi, listen
 from paste.deploy import loadwsgi
-from eventlet.green import socket, ssl, os as green_os
+from eventlet.green import socket, ssl
 from io import BytesIO
 
 import six
@@ -957,6 +957,30 @@ class ServersPerPortStrategy(StrategyBase):
             for pid, _sock in port_data]
 
 
+class SignalTimeout(BaseException):
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self.old_handler = signal.SIG_DFL
+
+    def alarm(self, *a):
+        raise self
+
+    def __enter__(self):
+        if self.timeout is None:
+            return
+        existing = signal.getitimer(signal.ITIMER_REAL)
+        if any(existing):
+            raise RuntimeError('alarm already set: %r' % (existing,))
+        self.old_handler = signal.signal(signal.SIGALRM, self.alarm)
+        signal.setitimer(signal.ITIMER_REAL, self.timeout)
+
+    def __exit__(self, *a):
+        if self.timeout is None:
+            return
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, self.old_handler)
+
+
 def check_config(conf_path, app_section, *args, **kwargs):
     # Load configuration, Set logger and Load request processor
     (conf, logger, log_name) = \
@@ -1051,76 +1075,75 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     signal.signal(signal.SIGHUP, stop_with_signal)
     signal.signal(signal.SIGUSR1, stop_with_signal)
 
-    while running_context[0]:
-        new_workers = {}  # pid -> status pipe
-        for sock, sock_info in strategy.new_worker_socks():
-            read_fd, write_fd = os.pipe()
-            pid = os.fork()
-            if pid == 0:
-                os.close(read_fd)
-                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    try:
+        while running_context[0]:
+            new_workers = {}  # pid -> status pipe
+            for sock, sock_info in strategy.new_worker_socks():
+                read_fd, write_fd = os.pipe()
+                pid = os.fork()
+                if pid == 0:
+                    os.close(read_fd)
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
-                def shutdown_my_listen_sock(signum, *args):
-                    greenio.shutdown_safe(sock)
+                    def shutdown_my_listen_sock(signum, *args):
+                        greenio.shutdown_safe(sock)
 
-                signal.signal(signal.SIGHUP, shutdown_my_listen_sock)
-                signal.signal(signal.SIGUSR1, shutdown_my_listen_sock)
-                strategy.post_fork_hook()
+                    signal.signal(signal.SIGHUP, shutdown_my_listen_sock)
+                    signal.signal(signal.SIGUSR1, shutdown_my_listen_sock)
+                    strategy.post_fork_hook()
 
-                def notify():
-                    os.write(write_fd, b'ready')
+                    def notify():
+                        os.write(write_fd, b'ready')
+                        os.close(write_fd)
+
+                    run_server(conf, logger, sock, ready_callback=notify,
+                               allow_modify_pipeline=allow_modify_pipeline)
+                    strategy.log_sock_exit(sock, sock_info)
+                    return 0
+                else:
                     os.close(write_fd)
+                    new_workers[pid] = read_fd
+                    strategy.register_worker_start(sock, sock_info, pid)
 
-                run_server(conf, logger, sock, ready_callback=notify,
-                           allow_modify_pipeline=allow_modify_pipeline)
-                strategy.log_sock_exit(sock, sock_info)
-                return 0
-            else:
-                os.close(write_fd)
-                new_workers[pid] = read_fd
-                strategy.register_worker_start(sock, sock_info, pid)
+            for pid, read_fd in new_workers.items():
+                worker_status = os.read(read_fd, 30)
+                os.close(read_fd)
+                if worker_status != b'ready':
+                    raise Exception(
+                        'worker %d did not start normally: %r' %
+                        (pid, worker_status))
 
-        for pid, read_fd in new_workers.items():
-            worker_status = os.read(read_fd, 30)
-            os.close(read_fd)
-            if worker_status != b'ready':
-                raise Exception(
-                    'worker %d did not start normally: %r' %
-                    (pid, worker_status))
+            # TODO: signal_ready() as soon as we have at least one new worker
+            # for each port, instead of waiting for all of them
+            strategy.signal_ready()
 
-        # TODO: signal_ready() as soon as we have at least one new worker for
-        # each port, instead of waiting for all of them
-        strategy.signal_ready()
+            # The strategy may need to pay attention to something in addition
+            # to child process exits (like new ports showing up in a ring).
+            #
+            # NOTE: a timeout value of None will instantiate the SignalTimeout
+            # but not actually set a timer, so we just block on wait().
+            loop_timeout = strategy.loop_timeout()
 
-        # The strategy may need to pay attention to something in addition to
-        # child process exits (like new ports showing up in a ring).
-        #
-        # NOTE: a timeout value of None will just instantiate the Timeout
-        # object and not actually schedule it, which is equivalent to no
-        # timeout for the green_os.wait().
-        loop_timeout = strategy.loop_timeout()
-
-        with Timeout(loop_timeout, exception=False):
             try:
-                try:
-                    pid, status = green_os.wait()
+                with SignalTimeout(loop_timeout):
+                    pid, status = os.wait()
                     if os.WIFEXITED(status) or os.WIFSIGNALED(status):
                         strategy.register_worker_exit(pid)
-                except OSError as err:
-                    if err.errno not in (errno.EINTR, errno.ECHILD):
-                        raise
-                    if err.errno == errno.ECHILD:
-                        # If there are no children at all (ECHILD), then
-                        # there's nothing to actually wait on. We sleep
-                        # for a little bit to avoid a tight CPU spin
-                        # and still are able to catch any KeyboardInterrupt
-                        # events that happen. The value of 0.01 matches the
-                        # value in eventlet's waitpid().
-                        sleep(0.01)
-            except KeyboardInterrupt:
-                logger.notice('User quit')
-                running_context[0] = False
-                break
+            except SignalTimeout:
+                pass
+            except OSError as err:
+                if err.errno not in (errno.EINTR, errno.ECHILD):
+                    raise
+                if err.errno == errno.ECHILD:
+                    # If there are no children at all (ECHILD), then
+                    # there's nothing to actually wait on. We sleep
+                    # for a little bit to avoid a tight CPU spin
+                    # and still are able to catch any KeyboardInterrupt
+                    # events that happen.
+                    sleep(loop_timeout)
+    except KeyboardInterrupt:
+        logger.notice('User quit')
+        running_context[0] = False
 
     if running_context[1] is not None:
         try:
