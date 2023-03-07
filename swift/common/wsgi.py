@@ -31,9 +31,9 @@ import warnings
 
 import eventlet
 import eventlet.debug
-from eventlet import greenio, GreenPool, sleep, wsgi, listen, Timeout
+from eventlet import greenio, GreenPool, sleep, wsgi, listen
 from paste.deploy import loadwsgi
-from eventlet.green import socket, ssl, os as green_os
+from eventlet.green import socket, ssl
 from io import BytesIO
 
 import six
@@ -901,6 +901,30 @@ class ServersPerPortStrategy(StrategyBase):
             for pid, _sock in port_data]
 
 
+class SignalTimeout(BaseException):
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self.old_handler = signal.SIG_DFL
+
+    def alarm(self, *a):
+        raise self
+
+    def __enter__(self):
+        if self.timeout is None:
+            return
+        existing = signal.getitimer(signal.ITIMER_REAL)
+        if any(existing):
+            raise RuntimeError('alarm already set: %r' % (existing,))
+        self.old_handler = signal.signal(signal.SIGALRM, self.alarm)
+        signal.setitimer(signal.ITIMER_REAL, self.timeout)
+
+    def __exit__(self, *a):
+        if self.timeout is None:
+            return
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, self.old_handler)
+
+
 def check_config(conf_path, app_section, *args, **kwargs):
     # Load configuration, Set logger and Load request processor
     (conf, logger, log_name) = \
@@ -1044,27 +1068,28 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
         # timeout for the green_os.wait().
         loop_timeout = strategy.loop_timeout()
 
-        with Timeout(loop_timeout, exception=False):
-            try:
-                try:
-                    pid, status = green_os.wait()
-                    if os.WIFEXITED(status) or os.WIFSIGNALED(status):
-                        strategy.register_worker_exit(pid)
-                except OSError as err:
-                    if err.errno not in (errno.EINTR, errno.ECHILD):
-                        raise
-                    if err.errno == errno.ECHILD:
-                        # If there are no children at all (ECHILD), then
-                        # there's nothing to actually wait on. We sleep
-                        # for a little bit to avoid a tight CPU spin
-                        # and still are able to catch any KeyboardInterrupt
-                        # events that happen. The value of 0.01 matches the
-                        # value in eventlet's waitpid().
-                        sleep(0.01)
-            except KeyboardInterrupt:
-                logger.notice('User quit')
-                running_context[0] = False
-                break
+        try:
+            with SignalTimeout(loop_timeout):
+                pid, status = os.wait()
+                if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                    strategy.register_worker_exit(pid)
+        except SignalTimeout:
+            pass
+        except OSError as err:
+            if err.errno not in (errno.EINTR, errno.ECHILD):
+                raise
+            if err.errno == errno.ECHILD:
+                # If there are no children at all (ECHILD), then
+                # there's nothing to actually wait on. We sleep
+                # for a little bit to avoid a tight CPU spin
+                # and still are able to catch any KeyboardInterrupt
+                # events that happen. The value of 0.01 matches the
+                # value in eventlet's waitpid().
+                sleep(0.01)
+        except KeyboardInterrupt:
+            logger.notice('User quit')
+            running_context[0] = False
+            break
 
     if running_context[1] is not None:
         try:
