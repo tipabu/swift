@@ -1507,7 +1507,6 @@ class TestUtils(unittest.TestCase):
                          '[fe80::0204:61ff:fe9d:f156]:6200/sdb')
         self.assertEqual(utils.node_to_string(dev, replication=True),
                          '[fe80::0204:61ff:ff9d:1234]:6400/sdb')
-
     def test_hash_path(self):
         # Yes, these tests are deliberately very fragile. We want to make sure
         # that if someones changes the results hash_path produces, they know it

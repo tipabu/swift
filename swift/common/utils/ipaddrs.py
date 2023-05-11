@@ -102,56 +102,43 @@ def parse_socket_string(socket_string, default_port):
     return (host, port)
 
 
+def errcheck(result, func, arguments):
+    if result != 0:
+        errno = ctypes.set_errno(0)
+        raise OSError(errno, "getifaddrs: %s" % os.strerror(errno))
+    return result
+
+
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-try:
-    getifaddrs = libc.getifaddrs
-    freeifaddrs = libc.freeifaddrs
-    netifaces = None  # for patching
-except AttributeError:
-    getifaddrs = None
-    freeifaddrs = None
-    try:
-        import netifaces
-    except ImportError:
-        raise ImportError('C function getifaddrs not available, '
-                          'and netifaces not installed')
-    else:
-        warnings.warn('getifaddrs is not available; falling back to the '
-                      'archived and no longer maintained netifaces project. '
-                      'This fallback will be removed in a future release; '
-                      'see https://bugs.launchpad.net/swift/+bug/2019233 for '
-                      'more information.', FutureWarning)
-else:
-    class sockaddr(ctypes.Structure):
-        _fields_ = [
-            ("sa_family", ctypes.c_int),
-            ("sa_ipv4", ctypes.c_ubyte * 4),
-            # For AF_INET6, ^^^ becomes... flowinfo, I think?
-            # Seems to usually be zeroed out
-            ("sa_ipv6", ctypes.c_ubyte * 16),
-        ]
+getifaddrs = libc.getifaddrs
+getifaddrs.errcheck = errcheck
+freeifaddrs = libc.freeifaddrs
 
-    class ifaddrs(ctypes.Structure):
-        pass
 
-    # Have to do this a little later so we can self-reference
-    ifaddrs._fields_ = [
-        ("ifa_next", ctypes.POINTER(ifaddrs)),
-        ("ifa_name", ctypes.c_char_p),
-        ("ifa_flags", ctypes.c_int),
-        ("ifa_addr", ctypes.POINTER(sockaddr)),
-        ("ifa_netmask", ctypes.POINTER(sockaddr)),
-        ("ifa_broadaddr", ctypes.POINTER(sockaddr)),
-        ("ifa_data", ctypes.c_void_p),
+class sockaddr(ctypes.Structure):
+    _fields_ = [
+        ("sa_family", ctypes.c_int),
+        ("sa_ipv4", ctypes.c_ubyte * 4),
+        # For AF_INET6, ^^^ becomes... flowinfo, I think?
+        # Seems to usually be zeroed out
+        ("sa_ipv6", ctypes.c_ubyte * 16),
     ]
 
-    def errcheck(result, func, arguments):
-        if result != 0:
-            errno = ctypes.set_errno(0)
-            raise OSError(errno, "getifaddrs: %s" % os.strerror(errno))
-        return result
 
-    getifaddrs.errcheck = errcheck
+class ifaddrs(ctypes.Structure):
+    pass
+
+
+# Have to do this a little later so we can self-reference
+ifaddrs._fields_ = [
+    ("ifa_next", ctypes.POINTER(ifaddrs)),
+    ("ifa_name", ctypes.c_char_p),
+    ("ifa_flags", ctypes.c_int),
+    ("ifa_addr", ctypes.POINTER(sockaddr)),
+    ("ifa_netmask", ctypes.POINTER(sockaddr)),
+    ("ifa_broadaddr", ctypes.POINTER(sockaddr)),
+    ("ifa_data", ctypes.c_void_p),
+]
 
 
 def whataremyips(ring_ip=None):
@@ -177,52 +164,31 @@ def whataremyips(ring_ip=None):
             pass
 
     addresses = []
-
-    if getifaddrs:
-        addrs = ctypes.POINTER(ifaddrs)()
-        getifaddrs(ctypes.byref(addrs))
-        try:
-            cur = addrs
-            while cur:
-                if not cur.contents.ifa_addr:
-                    # Not all interfaces will have addresses; move on
-                    cur = cur.contents.ifa_next
-                    continue
-                sa_family = cur.contents.ifa_addr.contents.sa_family
-                if sa_family == socket.AF_INET:
-                    addresses.append(
-                        socket.inet_ntop(
-                            socket.AF_INET,
-                            cur.contents.ifa_addr.contents.sa_ipv4,
-                        )
-                    )
-                elif sa_family == socket.AF_INET6:
-                    addresses.append(
-                        socket.inet_ntop(
-                            socket.AF_INET6,
-                            cur.contents.ifa_addr.contents.sa_ipv6,
-                        )
-                    )
+    addrs = ctypes.POINTER(ifaddrs)()
+    getifaddrs(ctypes.byref(addrs))
+    try:
+        cur = addrs
+        while cur:
+            if not cur.contents.ifa_addr:
+                # Not all interfaces will have addresses; move on
                 cur = cur.contents.ifa_next
-        finally:
-            freeifaddrs(addrs)
-        return addresses
-
-    # getifaddrs not available; try netifaces
-    for interface in netifaces.interfaces():
-        try:
-            iface_data = netifaces.ifaddresses(interface)
-            for family in iface_data:
-                if family not in (netifaces.AF_INET, netifaces.AF_INET6):
-                    continue
-                for address in iface_data[family]:
-                    addr = address['addr']
-
-                    # If we have an ipv6 address remove the
-                    # %ether_interface at the end
-                    if family == netifaces.AF_INET6:
-                        addr = expand_ipv6(addr.split('%')[0])
-                    addresses.append(addr)
-        except ValueError:
-            pass
+                continue
+            sa_family = cur.contents.ifa_addr.contents.sa_family
+            if sa_family == socket.AF_INET:
+                addresses.append(
+                    socket.inet_ntop(
+                        socket.AF_INET,
+                        cur.contents.ifa_addr.contents.sa_ipv4,
+                    )
+                )
+            elif sa_family == socket.AF_INET6:
+                addresses.append(
+                    socket.inet_ntop(
+                        socket.AF_INET6,
+                        cur.contents.ifa_addr.contents.sa_ipv6,
+                    )
+                )
+            cur = cur.contents.ifa_next
+    finally:
+        freeifaddrs(addrs)
     return addresses
