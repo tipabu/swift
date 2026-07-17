@@ -161,9 +161,17 @@ class Connection(object):
         return url, {}
 
 
-def get_boto3_conn(aws_access_key, aws_secret_key):
+def get_boto3_conn(aws_access_key, aws_secret_key, signature_version=None):
     endpoint_url = tf.config['s3_storage_url']
-    config = boto3.session.Config(s3={'addressing_style': 'path'})
+    config_kwargs = {'s3': {'addressing_style': 'path'}}
+    if signature_version is None and os.environ.get('S3_USE_SIGV4') == 'True':
+        # Match the boto2-based tests, where the SigV4 variants toggle this
+        # environment variable; without S3_USE_SIGV4 we let botocore pick its
+        # default (s3v4) so already-converted tests keep their behavior.
+        signature_version = 's3v4'
+    if signature_version is not None:
+        config_kwargs['signature_version'] = signature_version
+    config = boto3.session.Config(**config_kwargs)
     return boto3.client(
         's3', aws_access_key_id=aws_access_key,
         aws_secret_access_key=aws_secret_key,

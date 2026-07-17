@@ -15,6 +15,8 @@
 
 import os
 
+from urllib.parse import urlparse
+
 import requests
 
 from swift.common.bufferedhttp import http_connect_raw
@@ -22,7 +24,8 @@ from swift.common.middleware.s3api.etree import fromstring
 
 import test.functional as tf
 
-from test.functional.s3api import S3ApiBase
+from test.functional.s3api import S3ApiBaseBoto3
+from test.functional.s3api.s3_test_client import get_boto3_conn
 from test.functional.s3api.utils import get_error_code, get_error_msg
 
 
@@ -34,7 +37,31 @@ def tearDownModule():
     tf.teardown_package()
 
 
-class TestS3ApiPresignedUrls(S3ApiBase):
+class TestS3ApiPresignedUrls(S3ApiBaseBoto3):
+    def setUp(self):
+        super(TestS3ApiPresignedUrls, self).setUp()
+        # Presigned URLs are signature-version specific, so build a client
+        # that signs the way the boto2-based tests used to: SigV2 by default,
+        # SigV4 for the SigV4 variant.
+        if os.environ.get('S3_USE_SIGV4') == 'True':
+            signature_version = 's3v4'
+        else:
+            signature_version = 's3'
+        self.conn = get_boto3_conn(
+            tf.config['s3_access_key'], tf.config['s3_secret_key'],
+            signature_version=signature_version)
+        parsed = urlparse(self.endpoint_url)
+        self.host = parsed.hostname
+        self.port = parsed.port
+
+    def _presigned_url(self, client_method, bucket, key=None, expires_in=3600,
+                       **params):
+        params['Bucket'] = bucket
+        if key is not None:
+            params['Key'] = key
+        return self.conn.generate_presigned_url(
+            client_method, Params=params, ExpiresIn=expires_in)
+
     def test_bucket(self):
         bucket = 'test-bucket'
         req_objects = ('object', 'object2')
@@ -42,11 +69,10 @@ class TestS3ApiPresignedUrls(S3ApiBase):
             'max_bucket_listing', 1000)
 
         # GET Bucket (Without Object)
-        status, _junk, _junk = self.conn.make_request('PUT', bucket)
-        self.assertEqual(status, 200)
+        self.conn.create_bucket(Bucket=bucket)
 
-        url, headers = self.conn.generate_url_and_headers('GET', bucket)
-        resp = requests.get(url, headers=headers)
+        url = self._presigned_url('list_objects', bucket)
+        resp = requests.get(url)
         self.assertEqual(resp.status_code, 200,
                          'Got %d %s' % (resp.status_code, resp.content))
         self.assertCommonResponseHeaders(resp.headers)
@@ -66,12 +92,9 @@ class TestS3ApiPresignedUrls(S3ApiBase):
 
         # GET Bucket (With Object)
         for obj in req_objects:
-            status, _junk, _junk = self.conn.make_request('PUT', bucket, obj)
-            self.assertEqual(
-                status, 200,
-                'Got %d response while creating %s' % (status, obj))
+            self.conn.put_object(Bucket=bucket, Key=obj, Body=b'')
 
-        resp = requests.get(url, headers=headers)
+        resp = requests.get(url)
         self.assertEqual(resp.status_code, 200,
                          'Got %d %s' % (resp.status_code, resp.content))
         self.assertCommonResponseHeaders(resp.headers)
@@ -97,14 +120,14 @@ class TestS3ApiPresignedUrls(S3ApiBase):
             self.assertIsNotNone(o.find('ETag').text)
             self.assertEqual(o.find('Size').text, '0')
             self.assertIsNotNone(o.find('StorageClass').text is not None)
-            self.assertEqual(o.find('Owner/ID').text, self.conn.user_id)
+            self.assertEqual(o.find('Owner/ID').text, self.access_key)
             self.assertEqual(o.find('Owner/DisplayName').text,
-                             self.conn.user_id)
+                             self.access_key)
         # DELETE Bucket
         for obj in req_objects:
-            self.conn.make_request('DELETE', bucket, obj)
-        url, headers = self.conn.generate_url_and_headers('DELETE', bucket)
-        resp = requests.delete(url, headers=headers)
+            self.conn.delete_object(Bucket=bucket, Key=obj)
+        url = self._presigned_url('delete_bucket', bucket)
+        resp = requests.delete(url)
         self.assertEqual(resp.status_code, 204,
                          'Got %d %s' % (resp.status_code, resp.content))
 
@@ -118,9 +141,8 @@ class TestS3ApiPresignedUrls(S3ApiBase):
         bucket = 'test-bucket'
 
         # Expiration date is too far in the future
-        url, headers = self.conn.generate_url_and_headers(
-            'GET', bucket, expires_in=2 ** 32)
-        resp = requests.get(url, headers=headers)
+        url = self._presigned_url('list_objects', bucket, expires_in=2 ** 32)
+        resp = requests.get(url)
         self.assertEqual(resp.status_code, 403,
                          'Got %d %s' % (resp.status_code, resp.content))
         self.assertEqual(get_error_code(resp.content),
@@ -132,9 +154,8 @@ class TestS3ApiPresignedUrls(S3ApiBase):
         bucket = 'test-bucket'
 
         # Expiration is negative
-        url, headers = self.conn.generate_url_and_headers(
-            'GET', bucket, expires_in=-1)
-        resp = requests.get(url, headers=headers)
+        url = self._presigned_url('list_objects', bucket, expires_in=-1)
+        resp = requests.get(url)
         self.assertEqual(resp.status_code, 400,
                          'Got %d %s' % (resp.status_code, resp.content))
         self.assertEqual(get_error_code(resp.content),
@@ -145,9 +166,8 @@ class TestS3ApiPresignedUrls(S3ApiBase):
         # Expiration date is too far in the future
         for exp in (7 * 24 * 60 * 60 + 1,
                     2 ** 63 - 1):
-            url, headers = self.conn.generate_url_and_headers(
-                'GET', bucket, expires_in=exp)
-            resp = requests.get(url, headers=headers)
+            url = self._presigned_url('list_objects', bucket, expires_in=exp)
+            resp = requests.get(url)
             self.assertEqual(resp.status_code, 400,
                              'Got %d %s' % (resp.status_code, resp.content))
             self.assertEqual(get_error_code(resp.content),
@@ -157,9 +177,9 @@ class TestS3ApiPresignedUrls(S3ApiBase):
 
         # Expiration date is *way* too far in the future, or isn't a number
         for exp in (2 ** 63, 'foo'):
-            url, headers = self.conn.generate_url_and_headers(
-                'GET', bucket, expires_in=2 ** 63)
-            resp = requests.get(url, headers=headers)
+            url = self._presigned_url(
+                'list_objects', bucket, expires_in=2 ** 63)
+            resp = requests.get(url)
             self.assertEqual(resp.status_code, 400,
                              'Got %d %s' % (resp.status_code, resp.content))
             self.assertEqual(get_error_code(resp.content),
@@ -171,13 +191,11 @@ class TestS3ApiPresignedUrls(S3ApiBase):
         bucket = 'test-bucket'
         obj = 'object'
 
-        status, _junk, _junk = self.conn.make_request('PUT', bucket)
-        self.assertEqual(status, 200)
+        self.conn.create_bucket(Bucket=bucket)
 
         # HEAD/missing object
-        head_url, headers = self.conn.generate_url_and_headers(
-            'HEAD', bucket, obj)
-        resp = requests.head(head_url, headers=headers)
+        head_url = self._presigned_url('head_object', bucket, obj)
+        resp = requests.head(head_url)
         self.assertEqual(resp.status_code, 404,
                          'Got %d %s' % (resp.status_code, resp.content))
 
@@ -189,65 +207,57 @@ class TestS3ApiPresignedUrls(S3ApiBase):
                          'SignatureDoesNotMatch')
 
         # PUT empty object
-        put_url, headers = self.conn.generate_url_and_headers(
-            'PUT', bucket, obj)
-        resp = requests.put(put_url, data=b'', headers=headers)
+        put_url = self._presigned_url('put_object', bucket, obj)
+        resp = requests.put(put_url, data=b'')
         self.assertEqual(resp.status_code, 200,
                          'Got %d %s' % (resp.status_code, resp.content))
         # GET empty object
-        get_url, headers = self.conn.generate_url_and_headers(
-            'GET', bucket, obj)
-        resp = requests.get(get_url, headers=headers)
+        get_url = self._presigned_url('get_object', bucket, obj)
+        resp = requests.get(get_url)
         self.assertEqual(resp.status_code, 200,
                          'Got %d %s' % (resp.status_code, resp.content))
         self.assertEqual(resp.content, b'')
 
         # PUT over object
-        resp = requests.put(put_url, data=b'foobar', headers=headers)
+        resp = requests.put(put_url, data=b'foobar')
         self.assertEqual(resp.status_code, 200,
                          'Got %d %s' % (resp.status_code, resp.content))
 
         # GET non-empty object
-        resp = requests.get(get_url, headers=headers)
+        resp = requests.get(get_url)
         self.assertEqual(resp.status_code, 200,
                          'Got %d %s' % (resp.status_code, resp.content))
         self.assertEqual(resp.content, b'foobar')
 
         # DELETE Object
-        delete_url, headers = self.conn.generate_url_and_headers(
-            'DELETE', bucket, obj)
-        resp = requests.delete(delete_url, headers=headers)
+        delete_url = self._presigned_url('delete_object', bucket, obj)
+        resp = requests.delete(delete_url)
         self.assertEqual(resp.status_code, 204,
                          'Got %d %s' % (resp.status_code, resp.content))
 
         # Final cleanup
-        status, _junk, _junk = self.conn.make_request('DELETE', bucket)
-        self.assertEqual(status, 204)
+        self.conn.delete_bucket(Bucket=bucket)
 
     def test_absolute_form_request(self):
         bucket = 'test-bucket'
 
-        put_url, headers = self.conn.generate_url_and_headers(
-            'PUT', bucket)
+        put_url = self._presigned_url('create_bucket', bucket)
         resp = http_connect_raw(
-            self.conn.host,
-            self.conn.port,
+            self.host,
+            self.port,
             'PUT',
             put_url,  # whole URL, not just the path/query!
-            headers=headers,
             ssl=put_url.startswith('https:'),
         ).getresponse()
         self.assertEqual(resp.status, 200,
                          'Got %d %s' % (resp.status, resp.read()))
 
-        delete_url, headers = self.conn.generate_url_and_headers(
-            'DELETE', bucket)
+        delete_url = self._presigned_url('delete_bucket', bucket)
         resp = http_connect_raw(
-            self.conn.host,
-            self.conn.port,
+            self.host,
+            self.port,
             'DELETE',
             delete_url,  # whole URL, not just the path/query!
-            headers=headers,
             ssl=delete_url.startswith('https:'),
         ).getresponse()
         self.assertEqual(resp.status, 204,

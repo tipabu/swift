@@ -15,12 +15,13 @@
 
 import unittest
 import os
+
+import botocore
+
 import test.functional as tf
-from swift.common.middleware.s3api.etree import fromstring
 from unittest import SkipTest
-from test.functional.s3api import S3ApiBase
-from test.functional.s3api.s3_test_client import Connection
-from test.functional.s3api.utils import get_error_code
+from test.functional.s3api import S3ApiBaseBoto3
+from test.functional.s3api.s3_test_client import get_boto3_conn
 
 
 def setUpModule():
@@ -31,7 +32,7 @@ def tearDownModule():
     tf.teardown_package()
 
 
-class TestS3Acl(S3ApiBase):
+class TestS3Acl(S3ApiBaseBoto3):
     def setUp(self):
         super(TestS3Acl, self).setUp()
         self.bucket = 'bucket'
@@ -41,105 +42,99 @@ class TestS3Acl(S3ApiBase):
             raise SkipTest(
                 'TestS3Acl requires s3_access_key3 and s3_secret_key3 '
                 'configured for reduced-access user')
-        status, headers, body = self.conn.make_request('PUT', self.bucket)
-        self.assertEqual(status, 200, body)
-        access_key3 = tf.config['s3_access_key3']
-        secret_key3 = tf.config['s3_secret_key3']
-        self.conn3 = Connection(access_key3, secret_key3, access_key3)
+        resp = self.conn.create_bucket(Bucket=self.bucket)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.conn3 = get_boto3_conn(
+            tf.config['s3_access_key3'], tf.config['s3_secret_key3'])
 
     def test_acl(self):
-        self.conn.make_request('PUT', self.bucket, self.obj)
-        query = 'acl'
+        self.conn.put_object(Bucket=self.bucket, Key=self.obj, Body=b'')
 
         # PUT Bucket ACL
-        headers = {'x-amz-acl': 'public-read'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, headers=headers,
-                                   query=query)
-        self.assertEqual(status, 200)
+        resp = self.conn.put_bucket_acl(
+            Bucket=self.bucket, ACL='public-read')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
         self.assertEqual(headers['content-length'], '0')
 
         # GET Bucket ACL
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, query=query)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_bucket_acl(Bucket=self.bucket)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
         # TODO: Fix the response that last-modified must be in the response.
         # self.assertTrue(headers['last-modified'] is not None)
-        self.assertEqual(headers['content-length'], str(len(body)))
-        self.assertTrue(headers['content-type'] is not None)
-        elem = fromstring(body, 'AccessControlPolicy')
-        owner = elem.find('Owner')
-        self.assertEqual(owner.find('ID').text, self.conn.user_id)
-        self.assertEqual(owner.find('DisplayName').text, self.conn.user_id)
-        acl = elem.find('AccessControlList')
-        self.assertTrue(acl.find('Grant') is not None)
+        self.assertIsNotNone(headers['content-type'])
+        self.assertEqual(resp['Owner']['ID'], self.access_key)
+        self.assertEqual(resp['Owner']['DisplayName'], self.access_key)
+        self.assertTrue(len(resp['Grants']) > 0)
 
         # GET Object ACL
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, self.obj, query=query)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object_acl(Bucket=self.bucket, Key=self.obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
         # TODO: Fix the response that last-modified must be in the response.
         # self.assertTrue(headers['last-modified'] is not None)
-        self.assertEqual(headers['content-length'], str(len(body)))
-        self.assertTrue(headers['content-type'] is not None)
-        elem = fromstring(body, 'AccessControlPolicy')
-        owner = elem.find('Owner')
-        self.assertEqual(owner.find('ID').text, self.conn.user_id)
-        self.assertEqual(owner.find('DisplayName').text, self.conn.user_id)
-        acl = elem.find('AccessControlList')
-        self.assertTrue(acl.find('Grant') is not None)
+        self.assertIsNotNone(headers['content-type'])
+        self.assertEqual(resp['Owner']['ID'], self.access_key)
+        self.assertEqual(resp['Owner']['DisplayName'], self.access_key)
+        self.assertTrue(len(resp['Grants']) > 0)
 
     def test_put_bucket_acl_error(self):
-        req_headers = {'x-amz-acl': 'public-read'}
-        aws_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
-        status, headers, body = \
-            aws_error_conn.make_request('PUT', self.bucket,
-                                        headers=req_headers, query='acl')
-        self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
+        aws_error_conn = get_boto3_conn(tf.config['s3_access_key'], 'invalid')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            aws_error_conn.put_bucket_acl(
+                Bucket=self.bucket, ACL='public-read')
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'SignatureDoesNotMatch')
 
-        status, headers, body = \
-            self.conn.make_request('PUT', 'nothing',
-                                   headers=req_headers, query='acl')
-        self.assertEqual(get_error_code(body), 'NoSuchBucket')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.put_bucket_acl(Bucket='nothing', ACL='public-read')
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'NoSuchBucket')
 
-        status, headers, body = \
-            self.conn3.make_request('PUT', self.bucket,
-                                    headers=req_headers, query='acl')
-        self.assertEqual(get_error_code(body), 'AccessDenied')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn3.put_bucket_acl(Bucket=self.bucket, ACL='public-read')
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'AccessDenied')
 
     def test_get_bucket_acl_error(self):
-        aws_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
-        status, headers, body = \
-            aws_error_conn.make_request('GET', self.bucket, query='acl')
-        self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
+        aws_error_conn = get_boto3_conn(tf.config['s3_access_key'], 'invalid')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            aws_error_conn.get_bucket_acl(Bucket=self.bucket)
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'SignatureDoesNotMatch')
 
-        status, headers, body = \
-            self.conn.make_request('GET', 'nothing', query='acl')
-        self.assertEqual(get_error_code(body), 'NoSuchBucket')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.get_bucket_acl(Bucket='nothing')
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'NoSuchBucket')
 
-        status, headers, body = \
-            self.conn3.make_request('GET', self.bucket, query='acl')
-        self.assertEqual(get_error_code(body), 'AccessDenied')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn3.get_bucket_acl(Bucket=self.bucket)
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'AccessDenied')
 
     def test_get_object_acl_error(self):
-        self.conn.make_request('PUT', self.bucket, self.obj)
+        self.conn.put_object(Bucket=self.bucket, Key=self.obj, Body=b'')
 
-        aws_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
-        status, headers, body = \
-            aws_error_conn.make_request('GET', self.bucket, self.obj,
-                                        query='acl')
-        self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
+        aws_error_conn = get_boto3_conn(tf.config['s3_access_key'], 'invalid')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            aws_error_conn.get_object_acl(Bucket=self.bucket, Key=self.obj)
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'SignatureDoesNotMatch')
 
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, 'nothing', query='acl')
-        self.assertEqual(get_error_code(body), 'NoSuchKey')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.get_object_acl(Bucket=self.bucket, Key='nothing')
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'NoSuchKey')
 
-        status, headers, body = \
-            self.conn3.make_request('GET', self.bucket, self.obj, query='acl')
-        self.assertEqual(get_error_code(body), 'AccessDenied')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn3.get_object_acl(Bucket=self.bucket, Key=self.obj)
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'AccessDenied')
 
 
 class TestS3AclSigV4(TestS3Acl):

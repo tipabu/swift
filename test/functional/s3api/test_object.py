@@ -16,30 +16,24 @@
 import unittest
 
 import base64
-import calendar
 import email.parser
-from email.utils import formatdate, parsedate
+from datetime import timedelta
 import os
 import struct
-from time import mktime
 from zlib import crc32
 
 import boto3
+import botocore
+import requests
 
 import test.functional as tf
 from swift.common import utils, swob
 
-from swift.common.middleware.s3api.etree import fromstring
-from swift.common.middleware.s3api.utils import S3Timestamp
-from swift.common.utils import md5, quote
+from swift.common.utils import md5
 
-from test.functional.s3api import S3ApiBase, SigV4Mixin, \
-    skip_boto2_sort_header_bug, S3ApiBaseBoto3, get_boto3_conn
-from test.functional.s3api.s3_test_client import Connection
+from test.functional.s3api import SigV4Mixin, S3ApiBaseBoto3, get_boto3_conn
 from test.functional.s3api.utils import get_error_code, calculate_md5, \
     get_error_msg
-
-DAY = 86400.0  # 60 * 60 * 24 (sec)
 
 
 def setUpModule():
@@ -166,16 +160,26 @@ class TestS3ApiObjectBoto3(S3ApiBaseBoto3):
         self.assertEqual('close', headers['connection'])
 
 
-class TestS3ApiObject(S3ApiBase):
+class TestS3ApiObject(S3ApiBaseBoto3):
     def setUp(self):
         super(TestS3ApiObject, self).setUp()
         self.bucket = 'bucket'
-        self.conn.make_request('PUT', self.bucket)
+        resp = self.conn.create_bucket(Bucket=self.bucket)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
 
     def _assertObjectEtag(self, bucket, obj, etag):
-        status, headers, _ = self.conn.make_request('HEAD', bucket, obj)
-        self.assertEqual(status, 200)  # sanity
-        self.assertCommonResponseHeaders(headers, etag)
+        resp = self.conn.head_object(Bucket=bucket, Key=obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'], etag)
+
+    def _presigned_put(self, bucket, obj, body=b'', headers=None):
+        # boto3 can't send arbitrary/unsupported request headers, so build a
+        # presigned URL and PUT to it directly with the requests library.
+        url = self.conn.generate_presigned_url(
+            'put_object', Params={'Bucket': bucket, 'Key': obj},
+            ExpiresIn=60)
+        return requests.put(url, data=body, headers=headers or {})
 
     def test_object(self):
         obj = u'object name with %-sign 🙂'
@@ -183,222 +187,262 @@ class TestS3ApiObject(S3ApiBase):
         etag = md5(content, usedforsecurity=False).hexdigest()
 
         # PUT Object
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, body=content)
-        self.assertEqual(status, 200)
+        resp = self.conn.put_object(
+            Bucket=self.bucket, Key=obj, Body=content)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
 
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('content-length' in headers)  # sanity
+        self.assertIn('content-length', headers)  # sanity
         self.assertEqual(headers['content-length'], '0')
         self._assertObjectEtag(self.bucket, obj, etag)
 
         # PUT Object Copy
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_obj'
-        self.conn.make_request('PUT', dst_bucket)
-        headers = {'x-amz-copy-source': '/%s/%s' % (self.bucket, obj)}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj,
-                                   headers=headers)
-        self.assertEqual(status, 200)
+        self.conn.create_bucket(Bucket=dst_bucket)
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj})
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
 
-        # PUT Object Copy with URL-encoded Source
-        dst_bucket = 'dst-bucket'
-        dst_obj = 'dst_obj'
-        self.conn.make_request('PUT', dst_bucket)
-        headers = {'x-amz-copy-source': quote('/%s/%s' % (self.bucket, obj))}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj,
-                                   headers=headers)
-        self.assertEqual(status, 200)
+        # PUT Object Copy with a dict source (botocore URL-encodes the source)
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj})
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
 
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertEqual(headers['content-length'], str(len(body)))
 
-        elem = fromstring(body, 'CopyObjectResult')
-        self.assertTrue(elem.find('LastModified').text is not None)
-        copy_resp_last_modified_xml = elem.find('LastModified').text
-        self.assertTrue(elem.find('ETag').text is not None)
-        self.assertEqual(etag, elem.find('ETag').text.strip('"'))
+        copy_result = resp['CopyObjectResult']
+        self.assertIsNotNone(copy_result['LastModified'])
+        copy_resp_last_modified = copy_result['LastModified']
+        self.assertIsNotNone(copy_result['ETag'])
+        self.assertEqual(etag, copy_result['ETag'].strip('"'))
         self._assertObjectEtag(dst_bucket, dst_obj, etag)
 
         # Check timestamp on Copy in listing:
-        status, headers, body = \
-            self.conn.make_request('GET', dst_bucket)
-        self.assertEqual(status, 200)
-        elem = fromstring(body, 'ListBucketResult')
+        resp = self.conn.list_objects(Bucket=dst_bucket)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
         self.assertEqual(
-            elem.find('Contents').find("LastModified").text,
-            copy_resp_last_modified_xml)
+            resp['Contents'][0]['LastModified'], copy_resp_last_modified)
 
         # GET Object copy
-        status, headers, body = \
-            self.conn.make_request('GET', dst_bucket, dst_obj)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(Bucket=dst_bucket, Key=dst_obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
 
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers, etag)
-        self.assertTrue(headers['last-modified'] is not None)
-        self.assertEqual(
-            float(S3Timestamp.from_s3xmlformat(copy_resp_last_modified_xml)),
-            calendar.timegm(parsedate(headers['last-modified'])))
-        self.assertTrue(headers['content-type'] is not None)
-        self.assertEqual(headers['content-length'], str(len(content)))
+        self.assertIsNotNone(headers['last-modified'])
+        self.assertEqual(resp['LastModified'], copy_resp_last_modified)
+        self.assertIsNotNone(headers['content-type'])
+        self.assertEqual(resp['ContentLength'], len(content))
 
         # GET Object
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
 
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers, etag)
-        self.assertTrue(headers['last-modified'] is not None)
-        self.assertTrue(headers['content-type'] is not None)
-        self.assertEqual(headers['content-length'], str(len(content)))
+        self.assertIsNotNone(headers['last-modified'])
+        self.assertIsNotNone(headers['content-type'])
+        self.assertEqual(resp['ContentLength'], len(content))
         self.assertEqual(headers['accept-ranges'], 'bytes')
 
         # HEAD Object
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj)
-        self.assertEqual(status, 200)
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
 
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers, etag)
-        self.assertTrue(headers['last-modified'] is not None)
-        self.assertTrue('content-type' in headers)
-        self.assertEqual(headers['content-length'], str(len(content)))
+        self.assertIsNotNone(headers['last-modified'])
+        self.assertIn('content-type', headers)
+        self.assertEqual(resp['ContentLength'], len(content))
         self.assertEqual(headers['accept-ranges'], 'bytes')
 
         # DELETE Object
-        status, headers, body = \
-            self.conn.make_request('DELETE', self.bucket, obj)
-        self.assertEqual(status, 204)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.delete_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(204, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
 
         # DELETE Non-Existent Object
-        status, headers, body = \
-            self.conn.make_request('DELETE', self.bucket, 'does-not-exist')
-        self.assertEqual(status, 204)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.delete_object(
+            Bucket=self.bucket, Key='does-not-exist')
+        self.assertEqual(204, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
 
     def test_put_object_error(self):
-        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
-        status, headers, body = \
-            auth_error_conn.make_request('PUT', self.bucket, 'object')
-        self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        auth_error_conn = get_boto3_conn(tf.config['s3_access_key'], 'invalid')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            auth_error_conn.put_object(
+                Bucket=self.bucket, Key='object', Body=b'')
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'SignatureDoesNotMatch')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
-        status, headers, body = \
-            self.conn.make_request('PUT', 'bucket2', 'object')
-        self.assertEqual(get_error_code(body), 'NoSuchBucket')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.put_object(Bucket='bucket2', Key='object', Body=b'')
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'NoSuchBucket')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
     def test_put_object_name_too_long(self):
-        status, headers, body = self.conn.make_request(
-            'PUT', self.bucket,
-            'x' * (tf.cluster_info['swift']['max_object_name_length'] + 1))
-        self.assertEqual(get_error_code(body), 'KeyTooLongError')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.put_object(
+                Bucket=self.bucket,
+                Key='x' * (
+                    tf.cluster_info['swift']['max_object_name_length'] + 1),
+                Body=b'')
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'KeyTooLongError')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
     def test_put_object_copy_error(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
         dst_bucket = 'dst-bucket'
-        self.conn.make_request('PUT', dst_bucket)
+        self.conn.create_bucket(Bucket=dst_bucket)
         dst_obj = 'dst_object'
 
-        headers = {'x-amz-copy-source': '/%s/%s' % (self.bucket, obj)}
-        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
-        status, headers, body = \
-            auth_error_conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        auth_error_conn = get_boto3_conn(tf.config['s3_access_key'], 'invalid')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            auth_error_conn.copy_object(
+                Bucket=dst_bucket, Key=dst_obj,
+                CopySource={'Bucket': self.bucket, 'Key': obj})
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'SignatureDoesNotMatch')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
         # /src/nothing -> /dst/dst
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, 'nothing')}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(get_error_code(body), 'NoSuchKey')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.copy_object(
+                Bucket=dst_bucket, Key=dst_obj,
+                CopySource={'Bucket': self.bucket, 'Key': 'nothing'})
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'NoSuchKey')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
         # /nothing/src -> /dst/dst
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % ('nothing', obj)}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        # TODO: source bucket is not check.
-        # self.assertEqual(get_error_code(body), 'NoSuchBucket')
+        # TODO: source bucket is not checked.
+        try:
+            self.conn.copy_object(
+                Bucket=dst_bucket, Key=dst_obj,
+                CopySource={'Bucket': 'nothing', 'Key': obj})
+        except botocore.exceptions.ClientError:
+            pass
 
         # /src/src -> /nothing/dst
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj)}
-        status, headers, body = \
-            self.conn.make_request('PUT', 'nothing', dst_obj, headers)
-        self.assertEqual(get_error_code(body), 'NoSuchBucket')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.copy_object(
+                Bucket='nothing', Key=dst_obj,
+                CopySource={'Bucket': self.bucket, 'Key': obj})
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'NoSuchBucket')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
     def test_get_object_error(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
-        status, headers, body = \
-            auth_error_conn.make_request('GET', self.bucket, obj)
-        self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        auth_error_conn = get_boto3_conn(tf.config['s3_access_key'], 'invalid')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            auth_error_conn.get_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'SignatureDoesNotMatch')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, 'invalid')
-        self.assertEqual(get_error_code(body), 'NoSuchKey')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.get_object(Bucket=self.bucket, Key='invalid')
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'NoSuchKey')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
-        status, headers, body = self.conn.make_request('GET', 'invalid', obj)
-        self.assertEqual(get_error_code(body), 'NoSuchBucket')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.get_object(Bucket='invalid', Key=obj)
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'NoSuchBucket')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
     def test_head_object_error(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
-        status, headers, body = \
-            auth_error_conn.make_request('HEAD', self.bucket, obj)
-        self.assertEqual(status, 403)
-        self.assertEqual(body, b'')  # sanity
-        self.assertEqual(headers['content-type'], 'application/xml')
+        auth_error_conn = get_boto3_conn(tf.config['s3_access_key'], 'invalid')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            auth_error_conn.head_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPStatusCode'], 403)
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, 'invalid')
-        self.assertEqual(status, 404)
-        self.assertEqual(body, b'')  # sanity
-        self.assertEqual(headers['content-type'], 'application/xml')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.head_object(Bucket=self.bucket, Key='invalid')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPStatusCode'], 404)
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
-        status, headers, body = \
-            self.conn.make_request('HEAD', 'invalid', obj)
-        self.assertEqual(status, 404)
-        self.assertEqual(body, b'')  # sanity
-        self.assertEqual(headers['content-type'], 'application/xml')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.head_object(Bucket='invalid', Key=obj)
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPStatusCode'], 404)
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
     def test_delete_object_error(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
-        status, headers, body = \
-            auth_error_conn.make_request('DELETE', self.bucket, obj)
-        self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        auth_error_conn = get_boto3_conn(tf.config['s3_access_key'], 'invalid')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            auth_error_conn.delete_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'SignatureDoesNotMatch')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
-        status, headers, body = \
-            self.conn.make_request('DELETE', 'invalid', obj)
-        self.assertEqual(get_error_code(body), 'NoSuchBucket')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.delete_object(Bucket='invalid', Key=obj)
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'NoSuchBucket')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
     def test_put_object_content_encoding(self):
         obj = 'object'
         etag = md5(usedforsecurity=False).hexdigest()
-        headers = {'Content-Encoding': 'gzip'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers)
-        self.assertEqual(status, 200)
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj)
-        self.assertTrue('content-encoding' in headers)  # sanity
+        resp = self.conn.put_object(
+            Bucket=self.bucket, Key=obj, ContentEncoding='gzip')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        headers = resp['ResponseMetadata']['HTTPHeaders']
+        self.assertIn('content-encoding', headers)  # sanity
         self.assertEqual(headers['content-encoding'], 'gzip')
         self.assertCommonResponseHeaders(headers)
         self._assertObjectEtag(self.bucket, obj, etag)
@@ -407,23 +451,24 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         content = b'abcdefghij'
         etag = md5(content, usedforsecurity=False).hexdigest()
-        headers = {'Content-MD5': calculate_md5(content)}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.put_object(
+            Bucket=self.bucket, Key=obj, Body=content,
+            ContentMD5=calculate_md5(content))
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
         self._assertObjectEtag(self.bucket, obj, etag)
 
     def test_put_object_content_type(self):
         obj = 'object'
         content = b'abcdefghij'
         etag = md5(content, usedforsecurity=False).hexdigest()
-        headers = {'Content-Type': 'text/plain'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 200)
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj)
+        resp = self.conn.put_object(
+            Bucket=self.bucket, Key=obj, Body=content,
+            ContentType='text/plain')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertEqual(headers['content-type'], 'text/plain')
         self.assertCommonResponseHeaders(headers)
         self._assertObjectEtag(self.bucket, obj, etag)
@@ -431,52 +476,48 @@ class TestS3ApiObject(S3ApiBase):
     def test_put_object_conditional_requests(self):
         obj = 'object'
         content = b'abcdefghij'
-        headers = {'If-None-Match': 'asdf'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 501)
+        resp = self._presigned_put(
+            self.bucket, obj, content, {'If-None-Match': 'asdf'})
+        self.assertEqual(resp.status_code, 501)
 
-        headers = {'If-Match': '*'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 501)
+        resp = self._presigned_put(
+            self.bucket, obj, content, {'If-Match': '*'})
+        self.assertEqual(resp.status_code, 501)
 
-        headers = {'If-Modified-Since': 'Sat, 27 Jun 2015 00:00:00 GMT'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 501)
+        resp = self._presigned_put(
+            self.bucket, obj, content,
+            {'If-Modified-Since': 'Sat, 27 Jun 2015 00:00:00 GMT'})
+        self.assertEqual(resp.status_code, 501)
 
-        headers = {'If-Unmodified-Since': 'Sat, 27 Jun 2015 00:00:00 GMT'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 501)
+        resp = self._presigned_put(
+            self.bucket, obj, content,
+            {'If-Unmodified-Since': 'Sat, 27 Jun 2015 00:00:00 GMT'})
+        self.assertEqual(resp.status_code, 501)
 
         # None of the above should actually have created an object
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj, {}, '')
-        self.assertEqual(status, 404)
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            self.conn.head_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPStatusCode'], 404)
 
         # But this will
-        headers = {'If-None-Match': '*'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 200)
+        resp = self._presigned_put(
+            self.bucket, obj, content, {'If-None-Match': '*'})
+        self.assertEqual(resp.status_code, 200)
 
         # And the if-none-match prevents overwrites
-        headers = {'If-None-Match': '*'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 412)
+        resp = self._presigned_put(
+            self.bucket, obj, content, {'If-None-Match': '*'})
+        self.assertEqual(resp.status_code, 412)
 
     def test_put_object_expect(self):
         obj = 'object'
         content = b'abcdefghij'
         etag = md5(content, usedforsecurity=False).hexdigest()
-        headers = {'Expect': '100-continue'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
+        resp = self._presigned_put(
+            self.bucket, obj, content, {'Expect': '100-continue'})
+        self.assertEqual(resp.status_code, 200)
+        self.assertCommonResponseHeaders(resp.headers)
         self._assertObjectEtag(self.bucket, obj, etag)
 
     def _test_put_object_headers(self, req_headers, expected_headers=None):
@@ -485,19 +526,16 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         content = b'abcdefghij'
         etag = md5(content, usedforsecurity=False).hexdigest()
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj,
-                                   req_headers, content)
-        self.assertEqual(status, 200)
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj)
+        resp = self._presigned_put(self.bucket, obj, content, req_headers)
+        self.assertEqual(resp.status_code, 200)
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         for header, value in expected_headers.items():
             self.assertIn(header.lower(), headers)
             self.assertEqual(headers[header.lower()], value)
         self.assertCommonResponseHeaders(headers)
         self._assertObjectEtag(self.bucket, obj, etag)
 
-    @skip_boto2_sort_header_bug
     def test_put_object_metadata(self):
         self._test_put_object_headers({
             'X-Amz-Meta-Bar': 'foo',
@@ -542,423 +580,420 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         content = b'abcdefghij'
         etag = md5(content, usedforsecurity=False).hexdigest()
-        headers = {'X-Amz-Storage-Class': 'STANDARD'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.put_object(
+            Bucket=self.bucket, Key=obj, Body=content,
+            StorageClass='STANDARD')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
         self._assertObjectEtag(self.bucket, obj, etag)
 
     def test_put_object_valid_delete_headers(self):
         obj = 'object'
         content = b'abcdefghij'
         ts = utils.Timestamp.now()
-        delete_at = {'X-Delete-At': str(int(ts) + 70)}
-        delete_after = {'X-Delete-After': str(int(ts) + 130)}
-        status, delete_at, body = \
-            self.conn.make_request('PUT', self.bucket, obj, delete_at, content)
-        self.assertEqual(status, 200)
-        status, delete_after, body = \
-            self.conn.make_request('PUT', self.bucket, obj, delete_after,
-                                   content)
-        self.assertEqual(status, 200)
+        resp = self._presigned_put(
+            self.bucket, obj, content,
+            {'X-Delete-At': str(int(ts) + 70)})
+        self.assertEqual(resp.status_code, 200)
+        resp = self._presigned_put(
+            self.bucket, obj, content,
+            {'X-Delete-After': str(int(ts) + 130)})
+        self.assertEqual(resp.status_code, 200)
 
     def test_object_expiration_header(self):
         # Test that X-Delete-At translates to x-amz-expiration.
         obj = 'expiring-object'
         content = b'test content'
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, {}, content)
-        self.assertEqual(status, 200)
+        resp = self.conn.put_object(
+            Bucket=self.bucket, Key=obj, Body=content)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
 
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj)
-        self.assertEqual(status, 200)
-        self.assertNotIn('x-amz-expiration', headers)
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj)
-        self.assertEqual(status, 200)
-        self.assertNotIn('x-amz-expiration', headers)
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertNotIn(
+            'x-amz-expiration', resp['ResponseMetadata']['HTTPHeaders'])
+        resp = self.conn.get_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertNotIn(
+            'x-amz-expiration', resp['ResponseMetadata']['HTTPHeaders'])
 
         # now set x-delete-at
         delete_at_ts = utils.Timestamp.now(delta=3600 * 1e5)
-        headers = {'X-Delete-At': str(delete_at_ts.ceil())}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers)
-        self.assertEqual(status, 200)
+        resp = self._presigned_put(
+            self.bucket, obj, content,
+            {'X-Delete-At': str(delete_at_ts.ceil())})
+        self.assertEqual(resp.status_code, 200)
+
+        expected = ('expiry-date="%s", rule-id="swift-object-expiration"'
+                    % swob.date_header_format(delete_at_ts))
 
         # HEAD should return x-amz-expiration
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj)
-        self.assertEqual(status, 200)
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertIn('x-amz-expiration', headers)
-        self.assertEqual('expiry-date="%s", rule-id="swift-object-expiration"'
-                         % swob.date_header_format(delete_at_ts),
-                         headers['x-amz-expiration'])
+        self.assertEqual(expected, headers['x-amz-expiration'])
 
         # GET should also return x-amz-expiration
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(Bucket=self.bucket, Key=obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertIn('x-amz-expiration', headers)
-        self.assertEqual('expiry-date="%s", rule-id="swift-object-expiration"'
-                         % swob.date_header_format(delete_at_ts),
-                         headers['x-amz-expiration'])
+        self.assertEqual(expected, headers['x-amz-expiration'])
 
     def test_put_object_invalid_x_delete_at(self):
         obj = 'object'
         content = b'abcdefghij'
         ts = utils.Timestamp.now()
-        headers = {'X-Delete-At': str(int(ts) - 140)}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 400)
-        self.assertEqual(get_error_code(body), 'InvalidArgument')
-        self.assertEqual(get_error_msg(body), 'X-Delete-At in past')
-        headers = {'X-Delete-At': 'test'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 400)
-        self.assertEqual(get_error_code(body), 'InvalidArgument')
-        self.assertEqual(get_error_msg(body), 'Non-integer X-Delete-At')
+        resp = self._presigned_put(
+            self.bucket, obj, content,
+            {'X-Delete-At': str(int(ts) - 140)})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(get_error_code(resp.content), 'InvalidArgument')
+        self.assertEqual(get_error_msg(resp.content), 'X-Delete-At in past')
+        resp = self._presigned_put(
+            self.bucket, obj, content, {'X-Delete-At': 'test'})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(get_error_code(resp.content), 'InvalidArgument')
+        self.assertEqual(
+            get_error_msg(resp.content), 'Non-integer X-Delete-At')
 
     def test_put_object_invalid_x_delete_after(self):
         obj = 'object'
         content = b'abcdefghij'
-        headers = {'X-Delete-After': 'test'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 400)
-        self.assertEqual(get_error_code(body), 'InvalidArgument')
-        self.assertEqual(get_error_msg(body), 'Non-integer X-Delete-After')
-        headers = {'X-Delete-After': '-140'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers, content)
-        self.assertEqual(status, 400)
-        self.assertEqual(get_error_code(body), 'InvalidArgument')
-        self.assertEqual(get_error_msg(body), 'X-Delete-After in past')
+        resp = self._presigned_put(
+            self.bucket, obj, content, {'X-Delete-After': 'test'})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(get_error_code(resp.content), 'InvalidArgument')
+        self.assertEqual(
+            get_error_msg(resp.content), 'Non-integer X-Delete-After')
+        resp = self._presigned_put(
+            self.bucket, obj, content, {'X-Delete-After': '-140'})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(get_error_code(resp.content), 'InvalidArgument')
+        self.assertEqual(
+            get_error_msg(resp.content), 'X-Delete-After in past')
+
+    def _copy_object_raw(self, dst_bucket, dst_obj, copy_source,
+                         extra_headers=None):
+        # Copies with deliberately-malformed copy-source query strings can't be
+        # expressed via boto3, so PUT to a presigned URL with the raw header.
+        headers = {'X-Amz-Copy-Source': copy_source}
+        if extra_headers:
+            headers.update(extra_headers)
+        url = self.conn.generate_presigned_url(
+            'put_object', Params={'Bucket': dst_bucket, 'Key': dst_obj},
+            ExpiresIn=60)
+        return requests.put(url, headers=headers)
 
     def test_put_object_copy_source_params(self):
         obj = 'object'
-        src_headers = {'X-Amz-Meta-Test': 'src'}
         src_body = b'some content'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        self.conn.make_request('PUT', self.bucket, obj, src_headers, src_body)
-        self.conn.make_request('PUT', dst_bucket)
+        self.conn.put_object(
+            Bucket=self.bucket, Key=obj, Body=src_body,
+            Metadata={'test': 'src'})
+        self.conn.create_bucket(Bucket=dst_bucket)
 
-        headers = {'X-Amz-Copy-Source': '/%s/%s?nonsense' % (
-            self.bucket, obj)}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(status, 400)
-        self.assertEqual(get_error_code(body), 'InvalidArgument')
+        resp = self._copy_object_raw(
+            dst_bucket, dst_obj, '/%s/%s?nonsense' % (self.bucket, obj))
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(get_error_code(resp.content), 'InvalidArgument')
 
-        headers = {'X-Amz-Copy-Source': '/%s/%s?versionId=null&nonsense' % (
-            self.bucket, obj)}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(status, 400)
-        self.assertEqual(get_error_code(body), 'InvalidArgument')
+        resp = self._copy_object_raw(
+            dst_bucket, dst_obj,
+            '/%s/%s?versionId=null&nonsense' % (self.bucket, obj))
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(get_error_code(resp.content), 'InvalidArgument')
 
-        headers = {'X-Amz-Copy-Source': '/%s/%s?versionId=null' % (
-            self.bucket, obj)}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
-        status, headers, body = \
-            self.conn.make_request('GET', dst_bucket, dst_obj)
-        self.assertEqual(status, 200)
-        self.assertEqual(headers['x-amz-meta-test'], 'src')
-        self.assertEqual(body, src_body)
+        resp = self._copy_object_raw(
+            dst_bucket, dst_obj,
+            '/%s/%s?versionId=null' % (self.bucket, obj))
+        self.assertEqual(resp.status_code, 200)
+        resp = self.conn.get_object(Bucket=dst_bucket, Key=dst_obj)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(resp['Metadata']['test'], 'src')
+        self.assertEqual(resp['Body'].read(), src_body)
 
     def test_put_object_copy_source(self):
         obj = 'object'
         content = b'abcdefghij'
         etag = md5(content, usedforsecurity=False).hexdigest()
-        self.conn.make_request('PUT', self.bucket, obj, body=content)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=content)
 
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        self.conn.make_request('PUT', dst_bucket)
+        self.conn.create_bucket(Bucket=dst_bucket)
 
         # /src/src -> /dst/dst
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj)}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj})
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
         self._assertObjectEtag(dst_bucket, dst_obj, etag)
 
         # /src/src -> /src/dst
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj)}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, dst_obj, headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.copy_object(
+            Bucket=self.bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj})
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
         self._assertObjectEtag(self.bucket, dst_obj, etag)
 
         # /src/src -> /src/src
         # need changes to copy itself (e.g. metadata)
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
-                   'X-Amz-Meta-Foo': 'bar',
-                   'X-Amz-Metadata-Directive': 'REPLACE'}
-        status, headers, body = \
-            self.conn.make_request('PUT', self.bucket, obj, headers)
-        self.assertEqual(status, 200)
+        resp = self.conn.copy_object(
+            Bucket=self.bucket, Key=obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj},
+            Metadata={'foo': 'bar'}, MetadataDirective='REPLACE')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
         self._assertObjectEtag(self.bucket, obj, etag)
-        self.assertCommonResponseHeaders(headers)
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
 
     def test_put_object_copy_metadata_directive(self):
         obj = 'object'
-        src_headers = {'X-Amz-Meta-Test': 'src'}
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        self.conn.make_request('PUT', self.bucket, obj, headers=src_headers)
-        self.conn.make_request('PUT', dst_bucket)
+        self.conn.put_object(
+            Bucket=self.bucket, Key=obj, Metadata={'test': 'src'})
+        self.conn.create_bucket(Bucket=dst_bucket)
 
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
-                   'X-Amz-Metadata-Directive': 'REPLACE',
-                   'X-Amz-Meta-Test': 'dst'}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
-        status, headers, body = \
-            self.conn.make_request('HEAD', dst_bucket, dst_obj)
-        self.assertEqual(headers['x-amz-meta-test'], 'dst')
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj},
+            MetadataDirective='REPLACE', Metadata={'test': 'dst'})
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
+        resp = self.conn.head_object(Bucket=dst_bucket, Key=dst_obj)
+        self.assertEqual(resp['Metadata']['test'], 'dst')
 
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
-                   'X-Amz-Metadata-Directive': 'COPY',
-                   'X-Amz-Meta-Test': 'dst'}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
-        status, headers, body = \
-            self.conn.make_request('HEAD', dst_bucket, dst_obj)
-        self.assertEqual(headers['x-amz-meta-test'], 'src')
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj},
+            MetadataDirective='COPY', Metadata={'test': 'dst'})
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
+        resp = self.conn.head_object(Bucket=dst_bucket, Key=dst_obj)
+        self.assertEqual(resp['Metadata']['test'], 'src')
 
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
-                   'X-Amz-Meta-Test2': 'dst',
-                   'X-Amz-Metadata-Directive': 'REPLACE'}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
-        status, headers, body = \
-            self.conn.make_request('HEAD', dst_bucket, dst_obj)
-        self.assertNotIn('x-amz-meta-test', headers)
-        self.assertEqual(headers['x-amz-meta-test2'], 'dst')
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj},
+            MetadataDirective='REPLACE', Metadata={'test2': 'dst'})
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
+        resp = self.conn.head_object(Bucket=dst_bucket, Key=dst_obj)
+        self.assertNotIn('test', resp['Metadata'])
+        self.assertEqual(resp['Metadata']['test2'], 'dst')
 
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
-                   'X-Amz-Metadata-Directive': 'BAD'}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
-        self.assertEqual(status, 400)
+        resp = self._copy_object_raw(
+            dst_bucket, dst_obj, '/%s/%s' % (self.bucket, obj),
+            extra_headers={'X-Amz-Metadata-Directive': 'BAD'})
+        self.assertEqual(resp.status_code, 400)
 
-    @skip_boto2_sort_header_bug
     def test_put_object_copy_source_if_modified_since(self):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
         etag = md5(usedforsecurity=False).hexdigest()
-        self.conn.make_request('PUT', self.bucket, obj)
-        self.conn.make_request('PUT', dst_bucket)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
+        self.conn.create_bucket(Bucket=dst_bucket)
 
-        _, headers, _ = self.conn.make_request('HEAD', self.bucket, obj)
-        src_datetime = mktime(parsedate(headers['last-modified']))
-        src_datetime = src_datetime - DAY
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
-                   'X-Amz-Copy-Source-If-Modified-Since':
-                   formatdate(src_datetime)}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers=headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        src_datetime = resp['LastModified'] - timedelta(days=1)
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj},
+            CopySourceIfModifiedSince=src_datetime)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
         self._assertObjectEtag(self.bucket, obj, etag)
 
-    @skip_boto2_sort_header_bug
     def test_put_object_copy_source_if_unmodified_since(self):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
         etag = md5(usedforsecurity=False).hexdigest()
-        self.conn.make_request('PUT', self.bucket, obj)
-        self.conn.make_request('PUT', dst_bucket)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
+        self.conn.create_bucket(Bucket=dst_bucket)
 
-        _, headers, _ = self.conn.make_request('HEAD', self.bucket, obj)
-        src_datetime = mktime(parsedate(headers['last-modified']))
-        src_datetime = src_datetime + DAY
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
-                   'X-Amz-Copy-Source-If-Unmodified-Since':
-                   formatdate(src_datetime)}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers=headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        src_datetime = resp['LastModified'] + timedelta(days=1)
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj},
+            CopySourceIfUnmodifiedSince=src_datetime)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
         self._assertObjectEtag(self.bucket, obj, etag)
 
-    @skip_boto2_sort_header_bug
     def test_put_object_copy_source_if_match(self):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
         etag = md5(usedforsecurity=False).hexdigest()
-        self.conn.make_request('PUT', self.bucket, obj)
-        self.conn.make_request('PUT', dst_bucket)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
+        self.conn.create_bucket(Bucket=dst_bucket)
 
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj)
-
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
-                   'X-Amz-Copy-Source-If-Match': etag}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers=headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj},
+            CopySourceIfMatch=etag)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
         self._assertObjectEtag(self.bucket, obj, etag)
 
-    @skip_boto2_sort_header_bug
     def test_put_object_copy_source_if_none_match(self):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
         etag = md5(usedforsecurity=False).hexdigest()
-        self.conn.make_request('PUT', self.bucket, obj)
-        self.conn.make_request('PUT', dst_bucket)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
+        self.conn.create_bucket(Bucket=dst_bucket)
 
-        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
-                   'X-Amz-Copy-Source-If-None-Match': 'none-match'}
-        status, headers, body = \
-            self.conn.make_request('PUT', dst_bucket, dst_obj, headers=headers)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
+        resp = self.conn.copy_object(
+            Bucket=dst_bucket, Key=dst_obj,
+            CopySource={'Bucket': self.bucket, 'Key': obj},
+            CopySourceIfNoneMatch='none-match')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertCommonResponseHeaders(
+            resp['ResponseMetadata']['HTTPHeaders'])
         self._assertObjectEtag(self.bucket, obj, etag)
 
     def test_get_object_response_content_type(self):
         obj = 'obj'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        query = 'response-content-type=text/plain'
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, query=query)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, ResponseContentType='text/plain')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
         self.assertEqual(headers['content-type'], 'text/plain')
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_get_object_response_content_language(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        query = 'response-content-language=en'
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, query=query)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, ResponseContentLanguage='en')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
         self.assertEqual(headers['content-language'], 'en')
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_get_object_response_cache_control(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        query = 'response-cache-control=private'
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, query=query)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, ResponseCacheControl='private')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
         self.assertEqual(headers['cache-control'], 'private')
 
     def test_get_object_response_content_disposition(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        query = 'response-content-disposition=inline'
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, query=query)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj,
+            ResponseContentDisposition='inline')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
         self.assertEqual(headers['content-disposition'], 'inline')
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_get_object_response_content_encoding(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        query = 'response-content-encoding=gzip'
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, query=query)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, ResponseContentEncoding='gzip')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
         self.assertEqual(headers['content-encoding'], 'gzip')
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_get_object_range(self):
         obj = 'object'
         content = b'abcdefghij'
-        headers = {'x-amz-meta-test': 'swift',
-                   'content-type': 'application/octet-stream'}
-        self.conn.make_request(
-            'PUT', self.bucket, obj, headers=headers, body=content)
+        self.conn.put_object(
+            Bucket=self.bucket, Key=obj, Body=content,
+            Metadata={'test': 'swift'},
+            ContentType='application/octet-stream')
 
-        headers = {'Range': 'bytes=1-5'}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 206)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, Range='bytes=1-5')
+        self.assertEqual(206, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('content-length' in headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('content-length', headers)
+        self.assertIn('accept-ranges', headers)
         self.assertEqual(headers['content-length'], '5')
-        self.assertTrue('x-amz-meta-test' in headers)
-        self.assertEqual('swift', headers['x-amz-meta-test'])
-        self.assertEqual(body, b'bcdef')
+        self.assertEqual(resp['Metadata'].get('test'), 'swift')
+        self.assertEqual(resp['Body'].read(), b'bcdef')
         self.assertEqual('application/octet-stream', headers['content-type'])
 
-        headers = {'Range': 'bytes=5-'}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 206)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, Range='bytes=5-')
+        self.assertEqual(206, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('content-length' in headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('content-length', headers)
+        self.assertIn('accept-ranges', headers)
         self.assertEqual(headers['content-length'], '5')
-        self.assertTrue('x-amz-meta-test' in headers)
-        self.assertEqual('swift', headers['x-amz-meta-test'])
-        self.assertEqual(body, b'fghij')
+        self.assertEqual(resp['Metadata'].get('test'), 'swift')
+        self.assertEqual(resp['Body'].read(), b'fghij')
 
-        headers = {'Range': 'bytes=-5'}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 206)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, Range='bytes=-5')
+        self.assertEqual(206, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
-        self.assertTrue('content-length' in headers)
+        self.assertIn('accept-ranges', headers)
+        self.assertIn('content-length', headers)
         self.assertEqual(headers['content-length'], '5')
-        self.assertTrue('x-amz-meta-test' in headers)
-        self.assertEqual('swift', headers['x-amz-meta-test'])
-        self.assertEqual(body, b'fghij')
+        self.assertEqual(resp['Metadata'].get('test'), 'swift')
+        self.assertEqual(resp['Body'].read(), b'fghij')
 
         ranges = ['1-2', '4-5']
 
-        headers = {'Range': 'bytes=%s' % ','.join(ranges)}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 206)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj,
+            Range='bytes=%s' % ','.join(ranges))
+        self.assertEqual(206, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
         self.assertIn('content-length', headers)
 
         self.assertIn('content-type', headers)  # sanity
         content_type, boundary = headers['content-type'].split(';')
 
         self.assertEqual('multipart/byteranges', content_type)
-        self.assertTrue(boundary.startswith('boundary='))  # sanity
-        boundary_str = boundary[len('boundary='):]
+        self.assertTrue(boundary.strip().startswith('boundary='))  # sanity
+        boundary_str = boundary.strip()[len('boundary='):]
 
+        body = resp['Body'].read()
         # TODO: Using swift.common.utils.multipart_byteranges_to_document_iters
         #       could be easy enough.
         parser = email.parser.BytesFeedParser()
@@ -989,163 +1024,158 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_get_object_if_modified_since(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        _, headers, _ = self.conn.make_request('HEAD', self.bucket, obj)
-        src_datetime = mktime(parsedate(headers['last-modified']))
-        src_datetime = src_datetime - DAY
-        headers = {'If-Modified-Since': formatdate(src_datetime)}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 200)
-        self.assertTrue('accept-ranges' in headers)
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        src_datetime = resp['LastModified'] - timedelta(days=1)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, IfModifiedSince=src_datetime)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
+        self.assertIn('accept-ranges', headers)
         self.assertCommonResponseHeaders(headers)
 
     def test_get_object_if_unmodified_since(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        _, headers, _ = self.conn.make_request('HEAD', self.bucket, obj)
-        src_datetime = mktime(parsedate(headers['last-modified']))
-        src_datetime = src_datetime + DAY
-        headers = \
-            {'If-Unmodified-Since': formatdate(src_datetime)}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 200)
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        src_datetime = resp['LastModified'] + timedelta(days=1)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, IfUnmodifiedSince=src_datetime)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
+
         # check we can use the last modified time from the listing...
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket)
-        elem = fromstring(body, 'ListBucketResult')
-        last_modified = elem.find('./Contents/LastModified').text
-        listing_datetime = S3Timestamp.from_s3xmlformat(last_modified)
+        resp = self.conn.list_objects(Bucket=self.bucket)
+        listing_datetime = resp['Contents'][0]['LastModified']
         # Make sure there's no fractions of a second
-        self.assertEqual(int(listing_datetime), float(listing_datetime))
-        header_datetime = formatdate(int(listing_datetime))
+        self.assertEqual(listing_datetime.microsecond, 0)
 
-        headers = {'If-Unmodified-Since': header_datetime}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, IfUnmodifiedSince=listing_datetime)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
-        headers = {'If-Modified-Since': header_datetime}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
+        try:
+            resp = self.conn.get_object(
+                Bucket=self.bucket, Key=obj,
+                IfModifiedSince=listing_datetime)
+            status = resp['ResponseMetadata']['HTTPStatusCode']
+            headers = resp['ResponseMetadata']['HTTPHeaders']
+        except botocore.exceptions.ClientError as e:
+            status = e.response['ResponseMetadata']['HTTPStatusCode']
+            headers = e.response['ResponseMetadata']['HTTPHeaders']
         self.assertEqual(status, 304)
-        self.assertTrue('accept-ranges' in headers)
-        self.assertCommonResponseHeaders(headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_get_object_if_match(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj)
-        etag = headers['etag']
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        etag = resp['ResponseMetadata']['HTTPHeaders']['etag']
 
-        headers = {'If-Match': etag}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 200)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, IfMatch=etag)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_get_object_if_none_match(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        headers = {'If-None-Match': 'none-match'}
-        status, headers, body = \
-            self.conn.make_request('GET', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 200)
-        self.assertTrue('accept-ranges' in headers)
+        resp = self.conn.get_object(
+            Bucket=self.bucket, Key=obj, IfNoneMatch='none-match')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
+        self.assertIn('accept-ranges', headers)
         self.assertCommonResponseHeaders(headers)
 
     def test_head_object_range(self):
         obj = 'object'
         content = b'abcdefghij'
-        self.conn.make_request('PUT', self.bucket, obj, body=content)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=content)
 
-        headers = {'Range': 'bytes=1-5'}
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj, headers=headers)
+        resp = self.conn.head_object(
+            Bucket=self.bucket, Key=obj, Range='bytes=1-5')
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertEqual(headers['content-length'], '5')
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
-        headers = {'Range': 'bytes=5-'}
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj, headers=headers)
+        resp = self.conn.head_object(
+            Bucket=self.bucket, Key=obj, Range='bytes=5-')
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertEqual(headers['content-length'], '5')
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
-        headers = {'Range': 'bytes=-5'}
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj, headers=headers)
+        resp = self.conn.head_object(
+            Bucket=self.bucket, Key=obj, Range='bytes=-5')
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertEqual(headers['content-length'], '5')
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_head_object_if_modified_since(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        _, headers, _ = self.conn.make_request('HEAD', self.bucket, obj)
-        dt = mktime(parsedate(headers['last-modified']))
-        dt = dt - DAY
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        dt = resp['LastModified'] - timedelta(days=1)
 
-        headers = {'If-Modified-Since': formatdate(dt)}
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 200)
+        resp = self.conn.head_object(
+            Bucket=self.bucket, Key=obj, IfModifiedSince=dt)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_head_object_if_unmodified_since(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        _, headers, _ = self.conn.make_request('HEAD', self.bucket, obj)
-        dt = mktime(parsedate(headers['last-modified']))
-        dt = dt + DAY
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        dt = resp['LastModified'] + timedelta(days=1)
 
-        headers = {'If-Unmodified-Since': formatdate(dt)}
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 200)
+        resp = self.conn.head_object(
+            Bucket=self.bucket, Key=obj, IfUnmodifiedSince=dt)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_head_object_if_match(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj)
-        etag = headers['etag']
+        resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
+        etag = resp['ResponseMetadata']['HTTPHeaders']['etag']
 
-        headers = {'If-Match': etag}
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 200)
+        resp = self.conn.head_object(
+            Bucket=self.bucket, Key=obj, IfMatch=etag)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
     def test_head_object_if_none_match(self):
         obj = 'object'
-        self.conn.make_request('PUT', self.bucket, obj)
+        self.conn.put_object(Bucket=self.bucket, Key=obj, Body=b'')
 
-        headers = {'If-None-Match': 'none-match'}
-        status, headers, body = \
-            self.conn.make_request('HEAD', self.bucket, obj, headers=headers)
-        self.assertEqual(status, 200)
+        resp = self.conn.head_object(
+            Bucket=self.bucket, Key=obj, IfNoneMatch='none-match')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('accept-ranges' in headers)
+        self.assertIn('accept-ranges', headers)
 
 
 class TestS3ApiObjectSigV4(TestS3ApiObject, SigV4Mixin):

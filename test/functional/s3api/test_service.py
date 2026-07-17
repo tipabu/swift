@@ -16,13 +16,12 @@
 import unittest
 import os
 
+import botocore
+
 import test.functional as tf
 
-from swift.common.middleware.s3api.etree import fromstring
-
-from test.functional.s3api import S3ApiBase
-from test.functional.s3api.s3_test_client import Connection
-from test.functional.s3api.utils import get_error_code
+from test.functional.s3api import S3ApiBaseBoto3
+from test.functional.s3api.s3_test_client import get_boto3_conn
 
 
 def setUpModule():
@@ -33,55 +32,72 @@ def tearDownModule():
     tf.teardown_package()
 
 
-class TestS3ApiService(S3ApiBase):
-    def setUp(self):
-        super(TestS3ApiService, self).setUp()
-
+class TestS3ApiService(S3ApiBaseBoto3):
     def test_service(self):
         # GET Service(without bucket)
-        status, headers, body = self.conn.make_request('GET')
-        self.assertEqual(status, 200)
+        resp = self.conn.list_buckets()
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
 
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue(headers['content-type'] is not None)
+        self.assertIsNotNone(headers['content-type'])
         # TODO; requires consideration
         # self.assertEqual(headers['transfer-encoding'], 'chunked')
 
-        elem = fromstring(body, 'ListAllMyBucketsResult')
-        buckets = elem.findall('./Buckets/Bucket')
-        self.assertEqual(list(buckets), [])
-        owner = elem.find('Owner')
-        self.assertEqual(self.conn.user_id, owner.find('ID').text)
-        self.assertEqual(self.conn.user_id, owner.find('DisplayName').text)
+        self.assertEqual(resp['Buckets'], [])
+        if tf.cluster_info['s3api'].get('s3_acl'):
+            self.assertEqual(resp['Owner']['ID'], self.access_key)
+            self.assertEqual(resp['Owner']['DisplayName'], self.access_key)
+        else:
+            self.assertIn('ID', resp['Owner'])
+            self.assertIn('DisplayName', resp['Owner'])
 
         # GET Service(with Bucket)
         req_buckets = ('bucket', 'bucket2')
         for bucket in req_buckets:
-            self.conn.make_request('PUT', bucket)
-        status, headers, body = self.conn.make_request('GET')
-        self.assertEqual(status, 200)
+            self.conn.create_bucket(Bucket=bucket)
+        resp = self.conn.list_buckets()
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
 
-        elem = fromstring(body, 'ListAllMyBucketsResult')
-        resp_buckets = elem.findall('./Buckets/Bucket')
-        self.assertEqual(len(list(resp_buckets)), 2)
+        resp_buckets = resp['Buckets']
+        self.assertEqual(len(resp_buckets), 2)
         for b in resp_buckets:
-            self.assertTrue(b.find('Name').text in req_buckets)
-            self.assertTrue(b.find('CreationDate') is not None)
+            self.assertIn(b['Name'], req_buckets)
+            self.assertIn('CreationDate', b)
 
     def test_service_error_signature_not_match(self):
-        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
-        status, headers, body = auth_error_conn.make_request('GET')
-        self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
-        self.assertEqual(headers['content-type'], 'application/xml')
+        auth_error_conn = get_boto3_conn(tf.config['s3_access_key'], 'invalid')
+        with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+            auth_error_conn.list_buckets()
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'SignatureDoesNotMatch')
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPHeaders'][
+                'content-type'], 'application/xml')
 
     def test_service_error_no_date_header(self):
         # Without x-amz-date/Date header, that makes 403 forbidden
-        status, headers, body = self.conn.make_request(
-            'GET', headers={'Date': '', 'x-amz-date': ''})
-        self.assertEqual(status, 403)
-        self.assertEqual(get_error_code(body), 'AccessDenied')
-        self.assertIn(b'AWS authentication requires a valid Date '
-                      b'or x-amz-date header', body)
+        def remove_date_header(request, **kwargs):
+            request.headers['Date'] = ''
+            for hdr in ('X-Amz-Date', 'x-amz-date'):
+                if hdr in request.headers:
+                    del request.headers[hdr]
+
+        self.conn.meta.events.register(
+            'before-send.s3.ListBuckets', remove_date_header)
+        try:
+            with self.assertRaises(botocore.exceptions.ClientError) as ctx:
+                self.conn.list_buckets()
+        finally:
+            self.conn.meta.events.unregister(
+                'before-send.s3.ListBuckets', remove_date_header)
+        self.assertEqual(
+            ctx.exception.response['ResponseMetadata']['HTTPStatusCode'], 403)
+        self.assertEqual(
+            ctx.exception.response['Error']['Code'], 'AccessDenied')
+        self.assertIn(
+            'AWS authentication requires a valid Date or x-amz-date header',
+            ctx.exception.response['Error']['Message'])
 
 
 class TestS3ApiServiceSigV4(TestS3ApiService):
