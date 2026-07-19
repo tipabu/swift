@@ -59,8 +59,12 @@ class TestS3ApiPresignedUrls(S3ApiBaseBoto3):
         params['Bucket'] = bucket
         if key is not None:
             params['Key'] = key
-        return self.conn.generate_presigned_url(
+        url = self.conn.generate_presigned_url(
             client_method, Params=params, ExpiresIn=expires_in)
+        if key is None and os.environ.get('S3_USE_SIGV4') != 'True' \
+                and '/?' not in url:
+            url = url.replace('?', '/?', 1)
+        return url
 
     def test_bucket(self):
         bucket = 'test-bucket'

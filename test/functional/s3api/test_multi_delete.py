@@ -17,6 +17,7 @@ import unittest
 import os
 
 import botocore
+import botocore.exceptions
 import requests
 
 import test.functional as tf
@@ -37,7 +38,11 @@ def tearDownModule():
 
 class TestS3ApiMultiDelete(S3ApiBaseBoto3):
     def _prepare_test_delete_multi_objects(self, bucket, objects):
-        self.conn.create_bucket(Bucket=bucket)
+        try:
+            self.conn.create_bucket(Bucket=bucket)
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] != 'BucketAlreadyOwnedByYou':
+                raise
         for obj in objects:
             self.conn.put_object(Bucket=bucket, Key=obj, Body=b'')
 

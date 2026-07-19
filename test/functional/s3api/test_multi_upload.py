@@ -56,8 +56,14 @@ class TestS3ApiMultiUpload(S3ApiBaseBoto3):
                 for i, etag in enumerate(etags)]
 
     def _create_bucket(self, bucket):
-        resp = self.conn.create_bucket(Bucket=bucket)
-        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        try:
+            resp = self.conn.create_bucket(Bucket=bucket)
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] != 'BucketAlreadyOwnedByYou':
+                raise
+            resp = e.response
+        else:
+            self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
         return resp
 
     def _upload_part(self, bucket, key, upload_id, content=None, part_num=1):

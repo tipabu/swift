@@ -176,9 +176,19 @@ class TestS3ApiObject(S3ApiBaseBoto3):
     def _presigned_put(self, bucket, obj, body=b'', headers=None):
         # boto3 can't send arbitrary/unsupported request headers, so build a
         # presigned URL and PUT to it directly with the requests library.
+        params = {'Bucket': bucket, 'Key': obj}
+        # Some headers are significant for signing, though
+        if 'Content-Type' in headers:
+            params['ContentType'] = headers['Content-Type']
+        meta = {
+            k[11:].lower(): v
+            for k, v in headers.items()
+            if k.lower().startswith('x-amz-meta-')
+        }
+        if meta:
+            params['Metadata'] = meta
         url = self.conn.generate_presigned_url(
-            'put_object', Params={'Bucket': bucket, 'Key': obj},
-            ExpiresIn=60)
+            'put_object', Params=params, ExpiresIn=60)
         return requests.put(url, data=body, headers=headers or {})
 
     def test_object(self):
@@ -530,6 +540,13 @@ class TestS3ApiObject(S3ApiBaseBoto3):
         self.assertEqual(resp.status_code, 200)
         resp = self.conn.head_object(Bucket=self.bucket, Key=obj)
         headers = resp['ResponseMetadata']['HTTPHeaders']
+
+        # Boto3 may warn about 'Failed to parse the "Expires" member as a
+        # timestamp: a valid HTTP-date timestamp. The unparsed value is
+        # available in the response under "ExpiresString".'
+        if 'ExpiresString' in resp and 'expires' not in headers:
+            headers['expires'] = resp['ExpiresString']
+
         for header, value in expected_headers.items():
             self.assertIn(header.lower(), headers)
             self.assertEqual(headers[header.lower()], value)
@@ -683,7 +700,9 @@ class TestS3ApiObject(S3ApiBaseBoto3):
         if extra_headers:
             headers.update(extra_headers)
         url = self.conn.generate_presigned_url(
-            'put_object', Params={'Bucket': dst_bucket, 'Key': dst_obj},
+            'copy_object', Params={
+                'Bucket': dst_bucket, 'Key': dst_obj,
+                'CopySource': copy_source},
             ExpiresIn=60)
         return requests.put(url, headers=headers)
 

@@ -38,9 +38,9 @@ def tearDownModule():
     tf.teardown_package()
 
 
-class S3ApiBase(unittest.TestCase):
+class S3ApiBaseBoto3(unittest.TestCase):
     def __init__(self, method_name):
-        super(S3ApiBase, self).__init__(method_name)
+        super().__init__(method_name)
         self.method_name = method_name
 
     @contextmanager
@@ -52,47 +52,6 @@ class S3ApiBase(unittest.TestCase):
         finally:
             logging.getLogger('boto').setLevel(original_level)
 
-    def setUp(self):
-        if not tf.config.get('s3_access_key'):
-            raise SkipTest('no s3api user configured')
-        if 's3api' not in tf.cluster_info:
-            raise SkipTest('s3api middleware is not enabled')
-        if boto is None:
-            raise SkipTest('boto 2.x library is not installed')
-        if tf.config.get('account'):
-            user_id = '%s:%s' % (tf.config['account'], tf.config['username'])
-        else:
-            user_id = tf.config['username']
-        try:
-            self.conn = Connection(
-                tf.config['s3_access_key'], tf.config['s3_secret_key'],
-                user_id=user_id)
-
-            self.conn.reset()
-        except Exception:
-            message = '%s got an error during initialize process.\n\n%s' % \
-                      (self.method_name, traceback.format_exc())
-            # TODO: Find a way to make this go to FAIL instead of Error
-            self.fail(message)
-
-    def assertCommonResponseHeaders(self, headers, etag=None):
-        """
-        asserting common response headers with args
-        :param headers: a dict of response headers
-        :param etag: a string of md5(content).hexdigest() if not given,
-                     this won't assert anything about etag. (e.g. DELETE obj)
-        """
-        self.assertTrue(headers['x-amz-id-2'] is not None)
-        self.assertTrue(headers['x-amz-request-id'] is not None)
-        self.assertTrue(headers['date'] is not None)
-        # TODO; requires consideration
-        # self.assertTrue(headers['server'] is not None)
-        if etag is not None:
-            self.assertTrue('etag' in headers)  # sanity
-            self.assertEqual(etag, headers['etag'].strip('"'))
-
-
-class S3ApiBaseBoto3(S3ApiBase):
     def setUp(self):
         if not tf.config.get('s3_access_key'):
             raise SkipTest('no s3api user configured')
@@ -113,6 +72,22 @@ class S3ApiBaseBoto3(S3ApiBase):
 
     def tearDown(self):
         tear_down_s3(self.conn)
+
+    def assertCommonResponseHeaders(self, headers, etag=None):
+        """
+        asserting common response headers with args
+        :param headers: a dict of response headers
+        :param etag: a string of md5(content).hexdigest() if not given,
+                     this won't assert anything about etag. (e.g. DELETE obj)
+        """
+        self.assertTrue(headers['x-amz-id-2'] is not None)
+        self.assertTrue(headers['x-amz-request-id'] is not None)
+        self.assertTrue(headers['date'] is not None)
+        # TODO; requires consideration
+        # self.assertTrue(headers['server'] is not None)
+        if etag is not None:
+            self.assertTrue('etag' in headers)  # sanity
+            self.assertEqual(etag, headers['etag'].strip('"'))
 
 
 def skip_boto2_sort_header_bug(m):
